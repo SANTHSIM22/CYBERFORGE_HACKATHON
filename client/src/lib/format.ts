@@ -1,3 +1,5 @@
+import { icon, type IconName } from './icons';
+
 // One consistent number style (en-US grouping, K/M/B) for every currency.
 const LOCALE = 'en-US';
 const nf = new Intl.NumberFormat(LOCALE);
@@ -67,10 +69,13 @@ export function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-export function toast(msg: string, kind: 'info' | 'good' | 'bad' = 'info', ttl = 6000) {
+const TOAST_ICON: Record<'info' | 'good' | 'bad', IconName> = { info: 'info', good: 'circle-check', bad: 'circle-alert' };
+
+export function toast(msg: string, kind: 'info' | 'good' | 'bad' = 'info', ttl = 6000, glyph: IconName = TOAST_ICON[kind]) {
   const host = document.getElementById('toasts');
   if (!host) return;
-  const t = el('div', `toast ${kind === 'info' ? '' : kind}`, msg);
+  const t = el('div', `toast ${kind === 'info' ? '' : kind}`);
+  t.append(icon(glyph, 16), el('span', '', msg));
   host.appendChild(t);
   setTimeout(() => t.remove(), ttl);
   while (host.children.length > 4) host.firstElementChild?.remove();

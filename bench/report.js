@@ -36,6 +36,14 @@ function load(logPath) {
 }
 
 const [a, b] = process.argv.slice(2).map(load);
+// Optional: results from re-runs after a suite (e.g. after a fix), by file name:
+// STRESS_10M, HEAVY_10M, SAFETY_10M (and the same with _1M).
+const over = (k) => process.env[k] && JSON.parse(fs.readFileSync(path.join(dir, process.env[k]), 'utf8'));
+for (const [sfx, run] of [['1M', a], ['10M', b]]) {
+  run.stress = over('STRESS_' + sfx) || run.stress;
+  run.heavy = over('HEAVY_' + sfx) || run.heavy;
+  run.safety = over('SAFETY_' + sfx) || run.safety;
+}
 const ms = (v) => (v == null ? '—' : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : v >= 100 ? `${Math.round(v)} ms` : `${v.toFixed(1)} ms`);
 const pct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
 const int = (v) => Math.round(v).toLocaleString('en-US');

@@ -8,7 +8,7 @@ const loadUPlot = () => (mod ??= import('uplot').then((m) => m.default));
 
 export type LineSpec = {
   xs: number[]; // unix seconds
-  ys: number[];
+  ys: (number | null)[]; // null = no value (drawn as a gap)
   label: string;
   tz: string;
   daily: boolean;
@@ -16,10 +16,11 @@ export type LineSpec = {
   fmtAxis?: (v: number) => string; // y ticks
   height?: number;
   color?: string; // css var, default --series-1
+  yMax?: number; // fixed top of the y-axis (e.g. 100 for percentages); default fits the data
   fmtX?: (unixSeconds: number) => string; // overrides date labels (axis + tooltip)
 };
 
-export type ChartHandle = { setData: (xs: number[], ys: number[]) => void; destroy: () => void };
+export type ChartHandle = { setData: (xs: number[], ys: (number | null)[]) => void; destroy: () => void };
 
 const tip = (() => {
   let t: HTMLDivElement | null = null;
@@ -52,13 +53,15 @@ function rgba(color: string, alpha: number): string {
 
 export async function lineChart(host: HTMLElement, spec: LineSpec): Promise<ChartHandle> {
   const uPlot = await loadUPlot();
+  await document.fonts?.ready; // canvas text: draw with Geist, not the fallback
   host.replaceChildren();
   const stroke = cssVar(spec.color ?? '--series-1');
   const muted = cssVar('--ink-muted');
   const grid = cssVar('--grid');
   const surface = cssVar('--surface');
   const height = spec.height ?? 260;
-  const font = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  const font = '11px "Geist Variable", system-ui, -apple-system, "Segoe UI", sans-serif';
+  const width = () => Math.max(200, host.clientWidth);
   const dayFmt = new Intl.DateTimeFormat('en-US', { timeZone: spec.tz, month: 'short', day: 'numeric' });
   const hourFmt = new Intl.DateTimeFormat('en-US', { timeZone: spec.tz, hour: 'numeric' });
   const tipFmt = new Intl.DateTimeFormat('en-US', spec.daily
@@ -66,7 +69,7 @@ export async function lineChart(host: HTMLElement, spec: LineSpec): Promise<Char
     : { timeZone: spec.tz, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
   const opts: uPlotType.Options = {
-    width: Math.max(260, host.clientWidth),
+    width: width(),
     height,
     padding: [12, 8, 0, 0],
     legend: { show: false },
@@ -75,7 +78,7 @@ export async function lineChart(host: HTMLElement, spec: LineSpec): Promise<Char
       points: { size: 9, width: 2, fill: stroke, stroke: surface },
       y: false,
     },
-    scales: { x: { time: true }, y: { range: (_u, _min, max) => [0, Math.max(1, max) * 1.15] } },
+    scales: { x: { time: true }, y: { range: (_u, _min, max) => [0, spec.yMax ?? Math.max(1, max) * 1.15] } },
     axes: [
       {
         stroke: muted, font, grid: { show: false }, ticks: { stroke: grid, width: 1, size: 4 }, space: 64,
@@ -135,7 +138,7 @@ export async function lineChart(host: HTMLElement, spec: LineSpec): Promise<Char
   };
   const u = new uPlot(opts, [spec.xs, spec.ys], host);
   u.over.addEventListener('mouseleave', () => (tip().style.display = 'none'));
-  const ro = new ResizeObserver(() => u.setSize({ width: Math.max(260, host.clientWidth), height }));
+  const ro = new ResizeObserver(() => u.setSize({ width: width(), height }));
   ro.observe(host);
   return {
     setData: (xs, ys) => u.setData([xs, ys]),

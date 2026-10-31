@@ -118,6 +118,8 @@ type Point struct {
 	RPS      int     `json:"rps"`
 	P95      float64 `json:"p95_ms"`
 	HitRatio float64 `json:"hit_ratio"`
+	ProbeRPS int     `json:"probe_rps"`    // cache-bypassed benchmark reads (ClickHouse only)
+	ProbeP95 float64 `json:"probe_p95_ms"`
 }
 
 type WindowStats struct {
@@ -153,6 +155,8 @@ func (w *Window) Stats(now time.Time, window int) WindowStats {
 			lookups += b.hits + b.stale + b.miss
 			p.RPS = b.all.n
 			p.P95 = b.all.quantile(0.95)
+			p.ProbeRPS = b.byp.n
+			p.ProbeP95 = b.byp.quantile(0.95)
 			if n := b.hits + b.stale + b.miss; n > 0 {
 				p.HitRatio = float64(b.hits+b.stale) / float64(n)
 			}

@@ -43,8 +43,9 @@ ClickHouse (a database built for analytics), keeps small pre-added totals
 API with an in-memory cache. Dashboards never touch a store database.
 
 **What that buys.** Dashboard reads answer in well under a millisecond from
-memory, new orders show up about a second after checkout, the numbers match a
-direct SQL query on the store database exactly, and the stores barely notice.
+memory, new orders show up about two seconds after checkout, the numbers match
+a direct SQL query on the store database exactly, and dashboards never send a
+query to a store database.
 The measured numbers at 1M and 10M rows are in [section 12](#12-results).
 
 ---
@@ -117,7 +118,7 @@ flowchart LR
 | **Ingester** | Reads each store's change stream, turns changes into rows, writes them to ClickHouse once a second for all stores together, updates the rollups, then tells Postgres "received". | One process can follow hundreds of stores; more ingesters split the stores between them. |
 | **ClickHouse** | Holds a copy of orders, order lines and products for every store, plus the rollups (pre-added totals per day, per hour, per product per day). | Columnar analytics database. Built for fast sums over many rows. |
 | **API** | Checks who is asking, answers dashboard questions from memory where it can, otherwise asks ClickHouse, and limits load. | Stateless. Run as many copies as needed. |
-| **Dashboard and Monitor** | Static web pages (Astro, served by nginx). Every number is fetched from the API with the viewer's token. | Monitor shows live latency, cache rate, ingest rate and lag, and benchmark results. |
+| **Dashboard and Monitor** | Static web pages (Astro, served by nginx). Every number is fetched from the API with the viewer's token. | Monitor shows live latency, cache rate, ingest rate and lag, one row of live charts per read path, and benchmark results. |
 | **Demo service** | Only when `DEMO_MODE=true`: add or cancel a real order, compare with direct SQL, run the stress tests from a button. | The only runtime service besides the ingester that can reach store databases. Off in production. |
 | **`tpctl`** | Command-line tool: create stores, load test data, verify, rebuild, run benchmarks. | |
 
@@ -484,14 +485,64 @@ the panel says which kind of run it shows.
 4. Click **▶ Run stress test** and **▶ Run write storm**: live progress, then the
    comparison panels update.
 5. Open Monitor: p50/p95/p99, cache rate, ingest events/s, per-store lag, and all
-   benchmark tables.
+   benchmark tables. Keep it open during **▶ Run stress test** to watch each
+   read path's charts fill in as its phase runs (see below).
 6. Show `bench/results/` (JSON + Markdown + the suite log) and the commands above.
+
+### Reading the Monitor charts during a stress test
+
+Monitor has one row of charts per read path, coloured like the stress-test
+bars. Each row shows requests per second, p95 server time and cache hit rate
+for the last 60 seconds, refreshed every 2 s.
+
+| Row | Colour | Traffic it shows |
+|---|---|---|
+| **Direct: primary DB** | orange | Reads on `api-direct`, the benchmark instance that queries each store's Postgres |
+| **ClickHouse only (cache bypassed)** | purple | Reads on `api` sent with `X-TP-Cache: bypass` (stress test, Compare button): no cache, no in-memory views |
+| **Aggregation layer (ClickHouse + cache)** | green | Normal dashboard reads on `api` |
+
+What to expect:
+
+- **The phases run one after another, so the rows light up in turn:**
+  baseline (no dashboard traffic), direct, aggregation, then ClickHouse only.
+  From the button each phase takes about 18 s (3 s warm-up + 15 s measured).
+  The window is 60 s, so the direct phase starts scrolling off soon after the
+  run ends.
+- **Direct traffic runs on for a few seconds after its phase ends.**
+  `api-direct` finishes the slow queries that were still running when the
+  load generator moved on.
+- **Aggregation starts slowly.** The cache is empty for the test's mix of
+  stores, widgets and ranges, so the first reads are calculated in ClickHouse
+  while the direct phase's last queries still use CPU. The hit rate then
+  climbs to over 90% and requests per second jump. On an axis that reaches
+  1,000+ req/s, the first seconds look flat.
+- **Cache hit rate is 0% on the direct and ClickHouse-only rows by design:**
+  neither path uses the cache.
+- **The charts show server time, measured inside each API.** The stress-test
+  table shows round trips measured by the load generator, without the warm-up,
+  so its numbers are higher than the charts'.
+- **The direct row needs `api-direct` running** (`compare` or `demo` profile).
+  nginx exposes only its stats route (`/api-direct/v1/admin/stats`). If the
+  service is not running, the row says so.
 
 ---
 
 ## 12. Results
 
-<!-- RESULTS -->
+Full tables, method and evidence files: **[RESULTS.md](RESULTS.md)**. Summary on
+one laptop (Ryzen 5 7520U, 4 cores / 8 threads):
+
+| Target | 1M (10 stores) | 10M (100 stores) | Verdict |
+|---|---|---|---|
+| Query speed (< 200 ms) | cold ClickHouse ≤ 62 ms p95 | cold ClickHouse ≤ 77 ms p95; API p99 84 ms at 1,297 req/s, 0 errors | Great |
+| Freshness (< 30 s) | p95 1.7 s | p95 1.8 s | Great |
+| Correctness | 701 / 701 exact | 6,932 / 6,932 exact | Great |
+| Growth 1M → 10M (< 2×) | | 1.11–1.86× on all 9 queries | Great |
+| Database safety (< 10%) | | 0 dashboard queries reach the stores, but on one laptop store p95 rose 97% from shared CPU | not met as measured |
+
+Under sustained writes on all 100 stores at once, ingestion on this laptop
+falls behind (about 24 s freshness at 300 transactions/s); see
+[RESULTS.md](RESULTS.md) for why and what fixes it on real servers.
 
 ---
 
@@ -523,6 +574,8 @@ Windows without `make`: `.\tp.ps1 <target>` with the same names.
 | Rebuild one store's copy with no downtime | `make rebuild SLUG=tenant-002` |
 | Pause / resume change capture | `tpctl capture pause-all` / `resume-all` |
 | Watch health | http://localhost:8088/monitor |
+| Pick up Go code changes | `docker compose build migrate && docker compose up -d api` (and any other Go service). The shared Go image is built by `migrate`, so `docker compose up -d --build api` alone keeps the old image |
+| Pick up web page changes | `docker compose up -d --build web` (or `npm run dev` in `client/`, which proxies `/api`, `/api-direct` and `/demo` to the local services) |
 
 Useful settings (`.env`): `INGEST_FLUSH_INTERVAL` (batching, default 1 s),
 `INGEST_VERSION_EVERY` (how often a store's data version may change, 1 s),

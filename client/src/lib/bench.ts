@@ -2,6 +2,7 @@
 // `tpctl stress` / `tpctl ladder` results (stored in ClickHouse by tpctl).
 import { get, token } from './api';
 import { compactNum, el, int, ms } from './format';
+import { icon } from './icons';
 
 type Pctl = { count: number; p50_ms: number; p95_ms: number; p99_ms: number };
 type Phase = {
@@ -80,12 +81,41 @@ const vs = (direct: number, layer: number, lowerIsBetter = true) => {
 const errCount = (p?: Phase) => Object.values(p?.dashboard_errors ?? {}).reduce((n, v) => n + v, 0);
 
 function stat(label: string, value: string, sub: string, good = true) {
-  const c = el('div', 'rounded-xl px-4 py-3');
-  c.style.background = 'var(--surface-2)';
-  const v = el('div', 'mt-1 text-2xl font-semibold tracking-tight tabnum', value);
-  v.style.color = good ? 'var(--good-text)' : 'var(--critical)';
-  c.append(el('div', 'ink-2 text-xs font-medium', label), v, el('div', 'muted mt-0.5 text-[11px]', sub));
+  const c = el('div', 'panel min-w-0 px-4 py-3.5');
+  const head = el('div', 'flex items-center justify-between gap-2');
+  const mark = icon(good ? 'circle-check' : 'circle-alert', 15);
+  mark.style.color = good ? 'var(--good)' : 'var(--critical)';
+  head.append(el('div', 'eyebrow min-w-0', label), mark);
+  const v = el('div', 'mt-1.5 text-2xl font-semibold tracking-[-0.03em] tabnum', value);
+  v.style.color = good ? 'var(--good-text)' : 'var(--critical-text)';
+  c.append(head, v, el('div', 'muted mt-0.5 text-[11px]', sub));
   return c;
+}
+
+type Col = readonly [header: string, right: boolean, hide?: string];
+
+/** A results table that fits its card: low-priority columns (`hide`) drop out on narrow screens. */
+function fitTable(cols: readonly Col[], rows: (string | HTMLElement)[][], cellTitle?: (r: number, c: number) => string) {
+  const table = el('table', 'mt-5 w-full text-sm tabnum');
+  const head = el('tr', 'border-b hairline text-left');
+  for (const [h, right, hide] of cols) head.append(el('th', `py-2.5 pr-2 font-medium ${right ? 'text-right' : ''} ${hide ?? ''}`, h));
+  const thead = el('thead');
+  thead.append(head);
+  const tbody = el('tbody');
+  rows.forEach((cells, ri) => {
+    const r = el('tr', 'border-b hairline last:border-0');
+    cells.forEach((cell, ci) => {
+      const [, right, hide] = cols[ci];
+      const td = el('td', `py-2 pr-2 ${right ? 'text-right' : ''} ${hide ?? ''}`);
+      td.append(cell);
+      const t = cellTitle?.(ri, ci);
+      if (t) td.title = t;
+      r.append(td);
+    });
+    tbody.append(r);
+  });
+  table.append(thead, tbody);
+  return table;
 }
 
 export function renderStress(host: HTMLElement, data: Bench['stress'], compact = false) {
@@ -97,20 +127,102 @@ export function renderStress(host: HTMLElement, data: Bench['stress'], compact =
   const s = data.result;
   const ph = pick(s);
   const d = ph.direct, a = ph.aggregation, c = ph.clickhouse;
-  if (!d || !a) {
+  
+  // Debug: log what phases we found
+  console.log('Phases found:', { direct: !!d, aggregation: !!a, clickhouse: !!c, total: s.phases.length });
+  console.log('All phases:', s.phases.map(p => ({ phase: p.phase, target: p.target })));
+  
+  if (!a) {
     host.append(el('p', 'muted text-sm', 'The latest stress run is missing the direct or aggregation phase.'));
     return;
   }
-  // Headline
-  const grid = el('div', 'grid grid-cols-2 gap-3 lg:grid-cols-4');
-  grid.append(
-    stat('p95 latency', vs(d.dashboard_latency.p95_ms, a.dashboard_latency.p95_ms).text, `${ms(d.dashboard_latency.p95_ms)} direct → ${ms(a.dashboard_latency.p95_ms)} aggregation`, vs(d.dashboard_latency.p95_ms, a.dashboard_latency.p95_ms).good),
-    stat('p99 latency', vs(d.dashboard_latency.p99_ms, a.dashboard_latency.p99_ms).text, `${ms(d.dashboard_latency.p99_ms)} → ${ms(a.dashboard_latency.p99_ms)}`, vs(d.dashboard_latency.p99_ms, a.dashboard_latency.p99_ms).good),
-    stat('Throughput', vs(d.dashboard_rps, a.dashboard_rps, false).text, `${compactNum(Math.round(d.dashboard_rps))} → ${compactNum(Math.round(a.dashboard_rps))} requests/s with ${s.vus} users`, vs(d.dashboard_rps, a.dashboard_rps, false).good),
-    stat('Store checkout p95 impact', `${d.store_oltp_p95_slowdown_pct >= 0 ? '+' : ''}${d.store_oltp_p95_slowdown_pct.toFixed(0)}% vs ${a.store_oltp_p95_slowdown_pct >= 0 ? '+' : ''}${a.store_oltp_p95_slowdown_pct.toFixed(0)}%`,
-      'direct vs aggregation · PRD target < 10%', a.store_oltp_p95_slowdown_pct < 10),
-  );
-  host.append(grid);
+  // Headline stats for all phases - Time series style graphs
+  const graphsGrid = el('div', 'mt-4 grid gap-4 lg:grid-cols-3');
+  
+  // Create time-series style cards for each phase
+  const phasesList = [
+    { phase: d, label: 'Direct: primary DB', color: '--series-2' },
+    { phase: c, label: 'ClickHouse only', color: '--series-3' },
+    { phase: a, label: 'Aggregation layer', color: '--series-1' },
+  ];
+
+  for (const { phase, label, color } of phasesList) {
+    if (!phase) continue;
+    
+    const card = el('div', 'card min-w-0 p-5');
+    
+    // Icon and title
+    const header = el('div', 'mb-2 flex items-start gap-3');
+    const iconTile = el('span', 'icon-tile');
+    iconTile.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>';
+    const titleDiv = el('div', 'min-w-0');
+    const title = el('h2', 'card-title flex items-center');
+    title.textContent = label;
+    const subtitle = el('p', 'muted text-xs');
+    subtitle.textContent = `p50 / p95 / p99 latencies`;
+    titleDiv.append(title, subtitle);
+    header.append(iconTile, titleDiv);
+    card.append(header);
+    
+    // Metrics display (large stats like the monitor page)
+    const metricsGrid = el('div', 'mt-4 grid grid-cols-3 gap-4');
+    
+    // Requests per second
+    const rpsBox = el('div');
+    const rpsLabel = el('div', 'eyebrow mb-1');
+    rpsLabel.textContent = 'Requests/sec';
+    const rpsValue = el('div', 'tabnum text-2xl font-semibold');
+    rpsValue.textContent = int(Math.round(phase.dashboard_rps));
+    const rpsSub = el('div', 'muted mt-0.5 text-[11px]');
+    rpsSub.textContent = `${int(phase.dashboard_requests)} total`;
+    rpsBox.append(rpsLabel, rpsValue, rpsSub);
+    
+    // Query time p95
+    const p95Box = el('div');
+    const p95Label = el('div', 'eyebrow mb-1');
+    p95Label.textContent = 'Query p95';
+    const p95Value = el('div', 'tabnum text-2xl font-semibold');
+    p95Value.textContent = ms(phase.dashboard_latency.p95_ms);
+    const p95Sub = el('div', 'muted mt-0.5 text-[11px]');
+    p95Sub.textContent = `p50 ${ms(phase.dashboard_latency.p50_ms)}`;
+    p95Box.append(p95Label, p95Value, p95Sub);
+    
+    // Cache hit rate
+    const cacheBox = el('div');
+    const cacheLabel = el('div', 'eyebrow mb-1');
+    cacheLabel.textContent = 'Cache hit';
+    const cacheValue = el('div', 'tabnum text-2xl font-semibold');
+    if (phase.cache_hit_ratio !== undefined) {
+      cacheValue.textContent = `${Math.round(phase.cache_hit_ratio * 100)}%`;
+    } else {
+      cacheValue.textContent = 'N/A';
+    }
+    const cacheSub = el('div', 'muted mt-0.5 text-[11px]');
+    cacheSub.textContent = phase.cache_hit_ratio !== undefined ? `of ${int(phase.dashboard_requests)} reads` : 'no cache';
+    cacheBox.append(cacheLabel, cacheValue, cacheSub);
+    
+    metricsGrid.append(rpsBox, p95Box, cacheBox);
+    card.append(metricsGrid);
+    
+    // Visual bar to show relative performance
+    const barSection = el('div', 'mt-4');
+    const barLabel = el('div', 'mb-2 text-xs font-semibold');
+    barLabel.textContent = 'Performance overview';
+    const barTrack = el('div', 'relative h-2 rounded-full');
+    barTrack.style.background = 'var(--surface-3)';
+    const barFill = el('div', 'h-2 rounded-full');
+    // Calculate relative performance (lower latency = better = more filled)
+    const maxLatency = 5000; // 5 seconds as max
+    const performance = Math.max(0, Math.min(100, (1 - phase.dashboard_latency.p95_ms / maxLatency) * 100));
+    barFill.style.cssText = `width: ${performance}%; background: var(${color}); transition: width 0.3s ease;`;
+    barTrack.append(barFill);
+    barSection.append(barLabel, barTrack);
+    card.append(barSection);
+    
+    graphsGrid.append(card);
+  }
+  
+  host.append(graphsGrid);
 
   // Percentile bars (one shared linear scale per percentile; values always labelled)
   const legend = el('div', 'ink-2 mt-4 flex flex-wrap gap-x-4 gap-y-1 text-[11px]');
@@ -133,7 +245,7 @@ export function renderStress(host: HTMLElement, data: Bench['stress'], compact =
       const p = phases[sr.key];
       if (!p) continue;
       const v = p.dashboard_latency[pk];
-      const row = el('div', 'mb-1.5 grid grid-cols-[1fr_auto] items-center gap-2');
+      const row = el('div', 'mb-1.5 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2');
       const track = el('div', 'h-3 rounded-r');
       const fill = el('div', 'h-3');
       fill.style.cssText = `width:${Math.max(0.8, (v / max) * 100)}%;background:var(${sr.color});border-radius:0 4px 4px 0`;
@@ -147,36 +259,26 @@ export function renderStress(host: HTMLElement, data: Bench['stress'], compact =
   host.append(bars);
 
   if (!compact) {
-    const table = el('table', 'mt-5 w-full text-sm tabnum');
-    const head = el('tr', 'muted border-b hairline text-left text-[11px] uppercase tracking-wide');
-    for (const [h, r] of [['Phase', false], ['Req/s', true], ['p50', true], ['p95', true], ['p99', true], ['Cache hits', true], ['Errors', true], ['Store p95', true], ['vs baseline', true]] as const) {
-      head.append(el('th', `py-2 font-medium ${r ? 'text-right' : ''}`, h));
-    }
-    const thead = el('thead');
-    thead.append(head);
-    const tbody = el('tbody');
-    for (const p of s.phases) {
-      const r = el('tr', 'border-b hairline last:border-0');
+    const cols: Col[] = [['Phase', false], ['Req/s', true], ['p50', true, 'hidden md:table-cell'], ['p95', true], ['p99', true, 'hidden md:table-cell'],
+      ['Cache hits', true, 'hidden sm:table-cell'], ['Errors', true, 'hidden lg:table-cell'], ['Store p95', true], ['vs baseline', true, 'hidden sm:table-cell']];
+    const rows = s.phases.map((p) => {
       const has = p.dashboard_requests > 0;
-      r.append(
-        el('td', 'py-2 pr-2', p.phase),
-        el('td', 'py-2 text-right', has ? int(Math.round(p.dashboard_rps)) : '—'),
-        el('td', 'py-2 text-right', has ? ms(p.dashboard_latency.p50_ms) : '—'),
-        el('td', 'py-2 text-right', has ? ms(p.dashboard_latency.p95_ms) : '—'),
-        el('td', 'py-2 text-right', has ? ms(p.dashboard_latency.p99_ms) : '—'),
-        Object.assign(el('td', 'py-2 text-right', p.target ? `${Math.round((p.cache_hit_ratio ?? 0) * 100)}%` : '—'), {
-          title: p.cache_stale_ratio ? `incl. ${Math.round(p.cache_stale_ratio * 100)}% served from the previous data version (≤ 5 s old) while the new answer was computed` : '',
-        }),
-        el('td', 'py-2 text-right', p.target ? String(errCount(p)) : '—'),
-        el('td', 'py-2 text-right', ms(p.store_oltp_latency.p95_ms)),
-        el('td', 'py-2 text-right', p.target ? `${p.store_oltp_p95_slowdown_pct >= 0 ? '+' : ''}${p.store_oltp_p95_slowdown_pct.toFixed(1)}%` : 'baseline'),
-      );
-      tbody.append(r);
-    }
-    table.append(thead, tbody);
-    const wrap = el('div', 'overflow-x-auto');
-    wrap.append(table);
-    host.append(wrap);
+      return [
+        p.phase,
+        has ? int(Math.round(p.dashboard_rps)) : '—',
+        has ? ms(p.dashboard_latency.p50_ms) : '—',
+        has ? ms(p.dashboard_latency.p95_ms) : '—',
+        has ? ms(p.dashboard_latency.p99_ms) : '—',
+        p.target ? `${Math.round((p.cache_hit_ratio ?? 0) * 100)}%` : '—',
+        p.target ? String(errCount(p)) : '—',
+        ms(p.store_oltp_latency.p95_ms),
+        p.target ? `${p.store_oltp_p95_slowdown_pct >= 0 ? '+' : ''}${p.store_oltp_p95_slowdown_pct.toFixed(1)}%` : 'baseline',
+      ];
+    });
+    host.append(fitTable(cols, rows, (r, c) => {
+      const stale = s.phases[r].cache_stale_ratio;
+      return c === 5 && stale ? `incl. ${Math.round(stale * 100)}% served from the previous data version (≤ 5 s old) while the new answer was computed` : '';
+    }));
   }
   const when = new Date(data.at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
   host.append(el('p', 'muted mt-3 text-[11px]',
@@ -185,13 +287,15 @@ export function renderStress(host: HTMLElement, data: Bench['stress'], compact =
 }
 
 const pct = (x: number) => `${x >= 0 ? '+' : ''}${x.toFixed(x > -10 && x < 10 ? 1 : 0)}%`;
-const trio = (p: Pctl) => (p.count ? `${ms(p.p50_ms)} / ${ms(p.p95_ms)} / ${ms(p.p99_ms)}` : '—');
+// Non-breaking "123 ms" so a narrow cell wraps only at the slashes.
+const nb = (v: number) => ms(v).replace(' ', ' ');
+const trio = (p: Pctl) => (p.count ? `${nb(p.p50_ms)} / ${nb(p.p95_ms)} / ${nb(p.p99_ms)}` : '—');
 
 /** Write storm: every store writing at a high rate while dashboards watch. */
 export function renderWrites(host: HTMLElement, data: Bench['writestorm'], compact = false) {
   host.replaceChildren();
   if (!data) {
-    host.append(el('p', 'muted text-sm', 'No write storm recorded yet. Click ▶ Run write storm, or run: make bench-writes.'));
+    host.append(el('p', 'muted text-sm', 'No write storm recorded yet. Click Run write storm, or run: make bench-writes.'));
     return;
   }
   const w = data.result;
@@ -204,7 +308,7 @@ export function renderWrites(host: HTMLElement, data: Bench['writestorm'], compa
     return;
   }
   const refName = by.pipeline_off ? 'with the analytics pipeline off' : 'with nobody viewing';
-  const grid = el('div', 'grid grid-cols-2 gap-3 lg:grid-cols-4');
+  const grid = el('div', 'grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4');
   grid.append(
     stat('Store writes sustained', `${int(Math.round(a.store_write_tps))}/s`,
       `${int(Math.round(a.store_tps))} store transactions/s across ${w.tenants} stores (target ${int(w.target_tps)})`, a.store_tps >= 0.9 * w.target_tps),
@@ -217,33 +321,19 @@ export function renderWrites(host: HTMLElement, data: Bench['writestorm'], compa
   );
   host.append(grid);
   if (!compact) {
-    const table = el('table', 'mt-5 w-full text-sm tabnum');
-    const head = el('tr', 'muted border-b hairline text-left text-[11px] uppercase tracking-wide');
-    for (const [h, r] of [['Phase', false], ['Store tx/s', true], ['Store p50 / p95 / p99', true], ['vs first', true], ['Dashboard p50 / p95 / p99', true],
-      ['Order visible p50 / p95 / p99', true], ['Ingest events/s', true], ['Catch-up', true]] as const) {
-      head.append(el('th', `py-2 font-medium ${r ? 'text-right' : ''}`, h));
-    }
-    const thead = el('thead');
-    thead.append(head);
-    const tbody = el('tbody');
-    for (const p of w.phases) {
-      const r = el('tr', 'border-b hairline last:border-0');
-      r.append(
-        el('td', 'py-2 pr-2', p.phase),
-        el('td', 'py-2 text-right', int(Math.round(p.store_tps))),
-        el('td', 'py-2 text-right', trio(p.store_latency)),
-        el('td', 'py-2 text-right', p === w.phases[0] ? 'baseline' : pct(p.store_p95_slowdown_pct)),
-        el('td', 'py-2 text-right', trio(p.dashboard_latency)),
-        el('td', 'py-2 text-right', p.key === 'direct' ? 'instant (reads the DB)' : trio(p.commit_to_dashboard)),
-        el('td', 'py-2 text-right', p.ingest_events_per_s ? int(Math.round(p.ingest_events_per_s)) : '—'),
-        el('td', 'py-2 text-right', p.catch_up_s ? `${p.catch_up_s.toFixed(1)} s` : '—'),
-      );
-      tbody.append(r);
-    }
-    table.append(thead, tbody);
-    const wrap = el('div', 'overflow-x-auto');
-    wrap.append(table);
-    host.append(wrap);
+    const cols: Col[] = [['Phase', false], ['Store tx/s', true, 'hidden sm:table-cell'], ['Store p50 / p95 / p99', true, 'hidden md:table-cell'], ['vs first', true],
+      ['Dashboard p50 / p95 / p99', true], ['Order visible p50 / p95 / p99', true, 'hidden sm:table-cell'], ['Ingest events/s', true, 'hidden lg:table-cell'], ['Catch-up', true, 'hidden lg:table-cell']];
+    const rows = w.phases.map((p) => [
+      p.phase,
+      int(Math.round(p.store_tps)),
+      trio(p.store_latency),
+      p === w.phases[0] ? 'baseline' : pct(p.store_p95_slowdown_pct),
+      trio(p.dashboard_latency),
+      p.key === 'direct' ? 'instant (reads the DB)' : trio(p.commit_to_dashboard),
+      p.ingest_events_per_s ? int(Math.round(p.ingest_events_per_s)) : '—',
+      p.catch_up_s ? `${p.catch_up_s.toFixed(1)} s` : '—',
+    ]);
+    host.append(fitTable(cols, rows));
   }
   const when = new Date(data.at).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
   host.append(el('p', 'muted mt-3 text-[11px]',
@@ -261,28 +351,29 @@ export function renderLadder(host: HTMLElement, data: Bench['ladder']) {
   }
   const l = data.result;
   const table = el('table', 'w-full text-sm tabnum');
-  const head = el('tr', 'muted border-b hairline text-left text-[11px] uppercase tracking-wide');
-  head.append(el('th', 'py-2 font-medium', 'Query (single user, p50 / p95)'));
-  for (const lv of ['No index', 'B-tree index', 'Covering index', 'ClickHouse']) head.append(el('th', 'py-2 text-right font-medium', lv));
+  const head = el('tr', 'border-b hairline text-left');
+  head.append(el('th', 'py-2.5 pr-2 font-medium', 'Query (single user, p50 / p95)'));
+  for (const lv of ['No index', 'B-tree index', 'Covering index', 'ClickHouse']) head.append(el('th', 'py-2.5 pr-2 text-right font-medium', lv));
   const thead = el('thead');
   thead.append(head);
   const tbody = el('tbody');
   for (const [q, r] of Object.entries(l.results)) {
     const row = el('tr', 'border-b hairline last:border-0');
-    row.append(el('td', 'py-2', q));
+    row.append(el('td', 'py-2 pr-2', q));
     const best = Math.min(...r.map((x) => x.p50_ms));
     for (const x of r) {
-      const td = el('td', 'py-2 text-right', `${ms(x.p50_ms)} / ${ms(x.p95_ms)}`);
-      if (x.p50_ms === best) td.classList.add('font-semibold');
+      const td = el('td', 'py-2 pr-2 text-right', `${ms(x.p50_ms)} / ${ms(x.p95_ms)}`);
+      if (x.p50_ms === best) {
+        td.classList.add('font-semibold');
+        td.style.color = 'var(--accent-text)';
+      }
       row.append(td);
     }
     tbody.append(row);
   }
   table.append(thead, tbody);
-  const wrap = el('div', 'overflow-x-auto');
-  wrap.append(table);
-  host.append(wrap, el('p', 'muted mt-2 text-[11px]',
-    `${l.tenant} (${int(l.orders)} orders) · ${l.iterations} runs per cell, one query at a time · bold = fastest. ` +
+  host.append(table, el('p', 'muted mt-2 text-[11px]',
+    `${l.tenant} (${int(l.orders)} orders) · ${l.iterations} runs per cell, one query at a time · highlighted = fastest. ` +
     `Single queries on an idle database: this isolates query speed. The stress test above shows what happens under concurrent load.`));
 }
 
@@ -317,16 +408,18 @@ function renderProgress(host: HTMLElement, s: StressStatus) {
     return;
   }
   const frac = p.stage === 'done' ? 1 : Math.min(1, (p.phase_index + Math.min(1, p.phase_elapsed_s / Math.max(p.phase_total_s, 1))) / Math.max(p.phase_count, 1));
-  const head = el('div', 'flex flex-wrap items-baseline justify-between gap-2 text-xs');
+  const head = el('div', 'flex flex-wrap items-center justify-between gap-2 text-xs');
   const stage = p.stage === 'warming_up' ? 'warming up' : 'measuring';
+  const title = el('span', 'flex min-w-0 items-center gap-2 font-medium');
+  title.append(icon('loader', 13, 'spin'), p.stage === 'done' ? 'All phases finished, publishing results…' : `Phase ${p.phase_index + 1} of ${p.phase_count}: ${p.phase}`);
   head.append(
-    el('span', 'font-medium', p.stage === 'done' ? 'All phases finished, publishing results…' : `Phase ${p.phase_index + 1} of ${p.phase_count}: ${p.phase}`),
+    title,
     el('span', 'muted tabnum', p.stage === 'done' ? '' : `${stage} · ${Math.floor(p.phase_elapsed_s)} / ${Math.round(p.phase_total_s)} s`),
   );
   const track = el('div', 'mt-2 h-2 w-full overflow-hidden rounded-full');
   track.style.background = 'var(--surface-3)';
   const fill = el('div', 'h-2 rounded-full');
-  fill.style.cssText = `width:${(frac * 100).toFixed(1)}%;background:var(--accent);transition:width .8s linear`;
+  fill.style.cssText = `width:${(frac * 100).toFixed(1)}%;background:var(--brand);transition:width .8s linear`;
   track.append(fill);
   host.append(head, track);
   const done = p.completed ?? [];
@@ -339,7 +432,7 @@ function renderProgress(host: HTMLElement, s: StressStatus) {
         if (w.dashboard_latency.count) bits.push(`dashboard p95 ${ms(w.dashboard_latency.p95_ms)}`);
         if (w.commit_to_dashboard.count) bits.push(`order visible p95 ${ms(w.commit_to_dashboard.p95_ms)}`);
         if (w.catch_up_s) bits.push(`caught up in ${w.catch_up_s.toFixed(1)} s`);
-        list.append(el('span', 'chip tabnum', `✓ ${w.phase.split(':')[0]}: ${bits.join(' · ')}`));
+        list.append(doneChip(`${w.phase.split(':')[0]}: ${bits.join(' · ')}`));
         continue;
       }
       const ph = any as Phase;
@@ -348,10 +441,19 @@ function renderProgress(host: HTMLElement, s: StressStatus) {
       const txt = ph.target
         ? `${name}: p95 ${ms(ph.dashboard_latency.p95_ms)} · ${Math.round(ph.dashboard_rps)} req/s · store ${slow}`
         : `Baseline: store p95 ${ms(ph.store_oltp_latency.p95_ms)}`;
-      list.append(el('span', 'chip tabnum', '✓ ' + txt));
+      list.append(doneChip(txt));
     }
     host.append(list);
   }
+}
+
+function doneChip(text: string) {
+  const c = el('span', 'chip tabnum');
+  const mark = icon('check', 12);
+  mark.style.color = 'var(--good)';
+  c.append(mark, el('span', '', text));
+  c.title = text;
+  return c;
 }
 
 export type TestButton = { btn: HTMLButtonElement; body: Record<string, unknown>; idle: string; busy: string };
@@ -367,8 +469,8 @@ export function wireStressButtons(buttons: TestButton[], host: HTMLElement, subj
   const setBusy = (busy: boolean, scenario?: string) => {
     for (const b of buttons) {
       b.btn.disabled = busy;
-      const mine = (b.body.scenario ?? 'reads') === (scenario ?? 'reads');
-      b.btn.textContent = busy && mine ? b.busy : b.idle;
+      const running = busy && (b.body.scenario ?? 'reads') === (scenario ?? 'reads');
+      b.btn.replaceChildren(icon(running ? 'loader' : 'play', 13, running ? 'spin' : ''), running ? b.busy : b.idle);
     }
   };
   const poll = async () => {
@@ -389,8 +491,9 @@ export function wireStressButtons(buttons: TestButton[], host: HTMLElement, subj
         polling = false;
         setBusy(false);
         if (s.error) {
-          const msg = el('div', 'text-xs', `Test failed: ${s.error}`);
-          msg.style.color = 'var(--critical)';
+          const msg = el('div', 'flex items-center gap-2 text-xs');
+          msg.append(icon('circle-alert', 14), el('span', '', `Test failed: ${s.error}`));
+          msg.style.color = 'var(--critical-text)';
           host.replaceChildren(msg);
         } else {
           host.classList.add('hidden');
@@ -411,7 +514,10 @@ export function wireStressButtons(buttons: TestButton[], host: HTMLElement, subj
       if (res.status === 202 || res.status === 409) return poll();
       setBusy(false);
       host.classList.remove('hidden');
-      host.replaceChildren(el('div', 'text-xs', `Could not start: ${res.json?.detail ?? res.json?.error ?? 'demo service unavailable'}`));
+      const msg = el('div', 'flex items-center gap-2 text-xs');
+      msg.append(icon('circle-alert', 14), el('span', '', `Could not start: ${res.json?.detail ?? res.json?.error ?? 'demo service unavailable'}`));
+      msg.style.color = 'var(--critical-text)';
+      host.replaceChildren(msg);
     });
   }
   // Resume watching if a run is already in progress (e.g. after a page reload).

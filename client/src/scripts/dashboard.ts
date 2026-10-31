@@ -2,6 +2,7 @@ import { ApiError, demo, demoAvailable, get, subjects, type Envelope, type Subje
 import { $, ago, compactNum, cssVar, currencySymbol, el, int, money, ms, pct, toast } from '../lib/format';
 import { compactTick, lineChart, sparkline, type ChartHandle } from '../lib/charts';
 import { loadBench, READ_TEST, renderStress, renderWrites, wireStressButtons, WRITE_TEST } from '../lib/bench';
+import { icon } from '../lib/icons';
 
 type Totals = { currency: string; orders: number; gross_sales: string; recognized_sales: string };
 type Summary = { totals: Totals[]; total_orders: number; timezone: string; from: string; to: string; previous: { totals: Totals[]; total_orders: number; from: string; to: string } };
@@ -59,7 +60,7 @@ function latency(id: string, env: { meta: Envelope<unknown>['meta']; rttMs: numb
   const hit = c === 'HIT' || c === 'STALE';
   if (c === 'STALE') state.sawStale = true;
   const dot = el('span', 'chip-dot');
-  dot.style.background = `var(${hit ? '--good' : '--series-1'})`;
+  dot.style.background = `var(${hit ? '--good' : '--series-3'})`;
   const how = c === 'HIT' ? 'served from cache' : c === 'STALE' ? 'from cache · refreshing' : c === 'MISS' ? 'computed in ClickHouse' : 'cache bypassed';
   n.replaceChildren(dot, el('span', 'tabnum', `${ms(env.meta.took_ms)} · ${how}`));
   n.title = `Server time ${ms(env.meta.took_ms)} · browser round trip ${ms(env.rttMs)} · data version ${env.meta.data_version}`;
@@ -123,8 +124,8 @@ async function init() {
   if (demoOn)
     wireStressButtons(
       [
-        { btn: $('stress-run') as HTMLButtonElement, body: READ_TEST, idle: '▶ Run stress test', busy: 'Stress test running…' },
-        { btn: $('writes-run') as HTMLButtonElement, body: WRITE_TEST, idle: '▶ Run write storm', busy: 'Write storm running…' },
+        { btn: $('stress-run') as HTMLButtonElement, body: READ_TEST, idle: 'Run stress test', busy: 'Stress test running…' },
+        { btn: $('writes-run') as HTMLButtonElement, body: WRITE_TEST, idle: 'Run write storm', busy: 'Write storm running…' },
       ],
       $('stress-progress'),
       subject(),
@@ -345,8 +346,8 @@ function setKPI(id: string, value: string, full: string, now: number, before: nu
     return;
   }
   const change = ((now - before) / before) * 100;
-  d.className = `chip tabnum ${change >= 0 ? 'delta-up' : 'delta-down'}`;
-  d.textContent = `${change >= 0 ? '▲' : '▼'} ${pct(Math.abs(change))}`;
+  d.className = `chip tabnum shrink-0 ${change >= 0 ? 'delta-up' : 'delta-down'}`;
+  d.replaceChildren(icon(change >= 0 ? 'trending-up' : 'trending-down', 12), el('span', '', pct(Math.abs(change))));
   d.title = `Previous period: ${id === 'orders' ? int(before) : money(before, state.currency)}`;
 }
 
@@ -383,9 +384,9 @@ function renderTrend() {
   const value = (p: Point) => (state.metric === 'orders' ? p.orders : Number(state.metric === 'gross' ? p.gross_sales : p.recognized_sales));
   if (state.view === 'table') {
     const table = el('table', 'w-full text-sm tabnum');
-    const head = el('tr', 'muted border-b hairline text-left text-[11px] uppercase tracking-wide');
+    const head = el('tr', 'border-b hairline text-left');
     for (const [h, right] of [[tr.grain === 'day' ? 'Day' : 'Hour', false], ['Orders', true], [`Gross (${tr.currency})`, true], [`Recognized (${tr.currency})`, true]] as const) {
-      head.appendChild(el('th', `py-1.5 font-medium ${right ? 'text-right' : ''}`, h));
+      head.appendChild(el('th', `py-2 pr-2 font-medium ${right ? 'text-right' : ''}`, h));
     }
     table.appendChild(head);
     for (const p of [...tr.points].reverse()) {
@@ -478,15 +479,15 @@ async function loadTop() {
     body.replaceChildren(
       ...ps.map((p) => {
         const r = el('tr', 'border-b hairline last:border-0');
-        const rank = el('td', 'py-2.5 align-middle');
-        const badge = el('span', 'tabnum inline-flex h-6 w-6 items-center justify-center rounded-md text-xs font-semibold', String(p.rank));
-        badge.style.background = p.rank <= 3 ? 'var(--series-1-wash)' : 'var(--surface-2)';
+        const rank = el('td', 'py-2.5 pr-3 align-middle');
+        const badge = el('span', 'tabnum inline-flex h-6 w-6 items-center justify-center rounded-lg text-xs font-semibold', String(p.rank));
+        badge.style.cssText = p.rank <= 3 ? 'background:var(--accent-wash);color:var(--accent-text)' : 'background:var(--surface-2);color:var(--ink-2)';
         rank.append(badge);
-        const name = el('td', 'py-2.5 pr-4');
-        name.append(el('div', 'max-w-[26rem] truncate font-medium', p.name));
-        if (p.sku) name.append(el('div', 'muted text-[11px]', p.sku));
+        const name = el('td', 'w-full max-w-0 py-2.5 pr-4'); // max-w-0 + w-full: long names truncate instead of widening the table
+        name.append(el('div', 'truncate font-medium', p.name));
+        if (p.sku) name.append(el('div', 'muted truncate text-[11px]', p.sku));
         const share = (Number(p.revenue) / sum) * 100;
-        const shareCell = el('td', 'hidden py-2.5 sm:table-cell');
+        const shareCell = el('td', 'hidden py-2.5 md:table-cell');
         const wrap = el('div', 'flex items-center gap-2');
         const track = el('div', 'h-1.5 flex-1 rounded-full');
         track.style.background = 'var(--surface-2)';
@@ -495,8 +496,8 @@ async function loadTop() {
         track.appendChild(fill);
         wrap.append(track, el('span', 'muted tabnum w-12 text-right text-xs', pct(share)));
         shareCell.appendChild(wrap);
-        r.append(rank, name, el('td', 'tabnum py-2.5 pr-6 text-right', compactNum(Number(p.quantity))),
-          el('td', 'tabnum py-2.5 pr-6 text-right font-semibold', money(p.revenue, env.data.currency)), shareCell);
+        r.append(rank, name, el('td', 'tabnum py-2.5 pr-3 text-right whitespace-nowrap sm:pr-6', compactNum(Number(p.quantity))),
+          el('td', 'tabnum py-2.5 pr-3 text-right font-semibold whitespace-nowrap sm:pr-6', money(p.revenue, env.data.currency)), shareCell);
         return r;
       }),
     );
@@ -523,7 +524,7 @@ async function poll() {
             await refresh();
             if (state.pending) {
               const took = (performance.now() - state.pending.t0) / 1000;
-              toast(`✓ ${state.pending.label} — on the dashboard ${took.toFixed(2)} s after commit`, 'good', 9000);
+              toast(`${state.pending.label} is on the dashboard ${took.toFixed(2)} s after commit`, 'good', 9000);
               state.pending = null;
             }
           }
@@ -541,6 +542,7 @@ function renderFresh(f: Fresh | null) {
   const host = $('fresh');
   const dot = el('span', 'chip-dot');
   let label = 'Connecting…', color = '--ink-muted';
+  if (f?.status === 'live') dot.classList.add('live');
   if (f) {
     const age = f.data_as_of ? Date.now() + skew - Date.parse(f.data_as_of) : null;
     switch (f.status) {
@@ -600,10 +602,10 @@ function wireDemo() {
     if (!other) return toast('Need at least two stores for this test', 'bad');
     try {
       await get(`/v1/tenants/${other.slug}/orders/summary?range=7d`, subject());
-      toast(`✕ Unexpected: ${state.slug} could read ${other.slug}`, 'bad');
+      toast(`Unexpected: ${state.slug} could read ${other.slug}`, 'bad');
     } catch (e) {
       const err = e as ApiError;
-      toast(`🔒 Blocked: ${state.slug}'s token asked for ${other.slug} and got HTTP ${err.status} — “${err.body?.detail ?? err.message}”`, 'good', 10000);
+      toast(`Blocked: ${state.slug}'s token asked for ${other.slug} and got HTTP ${err.status}: “${err.body?.detail ?? err.message}”`, 'good', 10000, 'shield-check');
     }
   });
   $('compare').addEventListener('click', (ev) => busy(ev.currentTarget as HTMLButtonElement, compare));
@@ -642,14 +644,14 @@ async function compare() {
 function renderCompare(body: HTMLElement, r: Compare) {
   const rows = [
     { label: 'Direct SQL on the store database', ms: r.direct.took_ms, note: 'Runs on the checkout database for every view', color: '--series-2' },
-    { label: 'ClickHouse, first view (cache bypassed)', ms: r.analytics_cold.took_ms, note: 'Once per data change; zero load on the store database', color: '--series-1' },
-    { label: 'Every repeat view (cache hit)', ms: r.analytics_warm.took_ms, note: 'Until the data changes', color: '--good' },
+    { label: 'ClickHouse, first view (cache bypassed)', ms: r.analytics_cold.took_ms, note: 'Once per data change; zero load on the store database', color: '--series-3' },
+    { label: 'Every repeat view (cache hit)', ms: r.analytics_warm.took_ms, note: 'Until the data changes', color: '--series-1' },
   ];
   const max = Math.max(...rows.map((x) => x.ms), 0.001);
-  const verdict = el('div', `mb-4 flex items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium ${r.match ? 'delta-up' : 'delta-down'}`);
-  verdict.textContent = r.match
-    ? `✓ Identical results${r.attempts > 1 ? ` (re-read ${r.attempts}× as writes landed in between)` : ''} · pipeline caught up in ${ms(r.watermark_wait_ms)}`
-    : `✕ ${r.differences?.length ?? 0} differences — listed below`;
+  const verdict = el('div', `mb-4 flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium ${r.match ? 'delta-up' : 'delta-down'}`);
+  verdict.append(icon(r.match ? 'circle-check' : 'circle-alert', 16), el('span', '', r.match
+    ? `Identical results${r.attempts > 1 ? ` (re-read ${r.attempts}× as writes landed in between)` : ''} · pipeline caught up in ${ms(r.watermark_wait_ms)}`
+    : `${r.differences?.length ?? 0} differences, listed below`));
   const bars = el('div', 'space-y-4');
   for (const x of rows) {
     const wrap = el('div');
@@ -667,12 +669,12 @@ function renderCompare(body: HTMLElement, r: Compare) {
     ? `ClickHouse answered ${r.speedup_vs_cold.toFixed(1)}× faster than direct SQL, and repeat views are ${Math.round(r.direct.took_ms / Math.max(r.analytics_warm.took_ms, 0.01)).toLocaleString('en-US')}× faster.`
     : `Direct SQL was faster for this query (${ms(r.direct.took_ms)} vs ${ms(r.analytics_cold.took_ms)}). Repeat views are ${Math.round(r.direct.took_ms / Math.max(r.analytics_warm.took_ms, 0.01)).toLocaleString('en-US')}× faster, and the store database does no dashboard work.`);
   const sqlHead = el('div', 'mt-5 flex items-center justify-between');
-  sqlHead.append(el('h3', 'muted text-[11px] font-semibold uppercase tracking-wide', 'Direct SQL that was run'));
-  const copy = el('button', 'btn h-7 text-xs', 'Copy');
-  copy.addEventListener('click', () => navigator.clipboard?.writeText(r.direct.sql).then(() => (copy.textContent = 'Copied')));
+  sqlHead.append(el('h3', 'eyebrow', 'Direct SQL that was run'));
+  const copy = el('button', 'btn h-8 px-3 text-xs');
+  copy.append(icon('copy', 13), 'Copy');
+  copy.addEventListener('click', () => navigator.clipboard?.writeText(r.direct.sql).then(() => copy.replaceChildren(icon('check', 13), 'Copied')));
   sqlHead.append(copy);
-  const pre = el('pre', 'mt-1.5 overflow-x-auto rounded-lg p-3 font-mono text-[11px] leading-relaxed', r.direct.sql);
-  pre.style.background = 'var(--surface-2)';
+  const pre = el('pre', 'panel mt-2 p-3 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap', r.direct.sql);
   body.replaceChildren(verdict, bars, speed, sqlHead, pre);
   if (r.differences?.length) {
     const ul = el('ul', 'mt-3 list-disc pl-5 text-xs');

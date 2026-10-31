@@ -31,7 +31,7 @@ minutes the first time.
 | Open | What |
 |---|---|
 | http://localhost:8088 | Dashboard |
-| http://localhost:8088/monitor | Monitoring: p50/p95/p99, cache hit rate, lag, events/s |
+| http://localhost:8088/monitor | Monitoring: p50/p95/p99, lag, events/s, and live charts (req/s, p95, cache hit rate) for each read path: direct DB, ClickHouse only, aggregation layer |
 | http://localhost:8080 | REST API (Postman / curl) |
 
 Check status: `docker compose ps` (all services `healthy`), then
@@ -78,7 +78,7 @@ curl -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/tenants/tenant-001/ord
 | `GET /v1/tenants/{t}/orders/breakdown?range=7d` | FR-4 current status of orders created in range |
 | `GET /v1/tenants/{t}/freshness` | B-1 |
 | `GET /v1/tenants/{t}` | timezone, currencies, status |
-| `GET /v1/admin/stats` (operator) | B-5 |
+| `GET /v1/admin/stats` (operator) | B-5; per-second series for dashboard reads and, separately, cache-bypassed benchmark reads |
 | `GET /metrics` | Prometheus |
 
 Ranges are half-open `[from, to)`. `from`/`to` accept RFC 3339 instants or
