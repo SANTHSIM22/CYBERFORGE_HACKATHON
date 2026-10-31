@@ -1,0 +1,294 @@
+# TenantPulse — local stack (same topology as production, single node each).
+#   cp .env.example .env && docker compose up -d --build
+#   open http://localhost:8088
+# Profiles: demo (live-demo buttons; on via COMPOSE_PROFILES), obs (Prometheus + Grafana), tools (tpctl, k6, pgbench).
+name: tenantpulse
+
+x-go: &go
+  image: tenantpulse/server:dev
+  restart: unless-stopped
+  environment: &go-env
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    AUTH_SECRET: ${AUTH_SECRET}
+    API_INTERNAL_URL: http://api:8080
+    CONTROL_OWNER_DSN: postgres://tp_owner:${TP_OWNER_PASSWORD}@control-postgres:5432/tenantpulse_control?sslmode=disable
+    CONTROL_INGEST_DSN: postgres://tp_ingest:${TP_INGEST_PASSWORD}@control-postgres:5432/tenantpulse_control?sslmode=disable
+    CONTROL_API_DSN: postgres://tp_api:${TP_API_PASSWORD}@control-postgres:5432/tenantpulse_control?sslmode=disable
+    SOURCE_ADMIN_DSN: postgres://tp_provisioner:${TP_PROVISIONER_PASSWORD}@source-postgres:5432/postgres?sslmode=disable
+    SOURCE_REPL_DSN: postgres://tp_replicator:${TP_REPLICATOR_PASSWORD}@source-postgres:5432/postgres?sslmode=disable
+    SOURCE_APP_DSN: postgres://tp_app:${TP_APP_PASSWORD}@source-postgres:5432/postgres?sslmode=disable
+    CLICKHOUSE_ADMIN_DSN: clickhouse://tp_admin:${CLICKHOUSE_ADMIN_PASSWORD}@clickhouse:9000/tp
+    CLICKHOUSE_INGEST_DSN: clickhouse://tp_ingest:${TP_CH_INGEST_PASSWORD}@clickhouse:9000/tp
+    CLICKHOUSE_API_DSN: clickhouse://tp_api:${TP_CH_API_PASSWORD}@clickhouse:9000/tp
+    CLICKHOUSE_MONITOR_DSN: clickhouse://tp_monitor:${TP_CH_MONITOR_PASSWORD}@clickhouse:9000/tp
+    MAX_CONCURRENT_SNAPSHOTS: ${MAX_CONCURRENT_SNAPSHOTS:-2}
+    RESULTS_DIR: /results
+
+services:
+  # Tenant source databases (one logical database per tenant), logical decoding on.
+  source-postgres:
+    image: postgres:18.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      TP_PROVISIONER_PASSWORD: ${TP_PROVISIONER_PASSWORD}
+      TP_REPLICATOR_PASSWORD: ${TP_REPLICATOR_PASSWORD}
+      TP_DEMO_PASSWORD: ${TP_DEMO_PASSWORD}
+      TP_APP_PASSWORD: ${TP_APP_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=${SOURCE_MAX_SLOTS:-250}
+      - -c
+      - max_wal_senders=${SOURCE_MAX_SLOTS:-250}
+      - -c
+      - max_slot_wal_keep_size=${SOURCE_MAX_SLOT_WAL:-20GB}
+      - -c
+      - max_connections=${SOURCE_MAX_CONNECTIONS:-500}
+      - -c
+      - shared_buffers=${SOURCE_SHARED_BUFFERS:-1GB}
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - logical_decoding_work_mem=64MB
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+    volumes:
+      - source-pg:/var/lib/postgresql
+      - ./deploy/postgres/source-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    ports:
+      - "127.0.0.1:${SOURCE_PG_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    shm_size: 512mb
+
+  # Control plane: tenant registry, generations, provisioning steps, audit.
+  control-postgres:
+    image: postgres:18.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      TP_OWNER_PASSWORD: ${TP_OWNER_PASSWORD}
+      TP_INGEST_PASSWORD: ${TP_INGEST_PASSWORD}
+      TP_API_PASSWORD: ${TP_API_PASSWORD}
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=200"]
+    volumes:
+      - control-pg:/var/lib/postgresql
+      - ./deploy/postgres/control-init.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    ports:
+      - "127.0.0.1:${CONTROL_PG_PORT:-5434}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tenantpulse_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Analytics store. Production: ReplicatedReplacingMergeTree + Distributed,
+  # sharded by tenant_id with replicas per shard (docs/architecture.md).
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: tp
+      CLICKHOUSE_USER: tp_admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Builds the shared Go image once (api, ingester, demo, tpctl) and applies schemas.
+  migrate:
+    <<: *go
+    build:
+      context: ./server
+    command: ["tpctl", "init"]
+    restart: "no"
+    environment:
+      <<: *go-env
+      TP_CH_INGEST_PASSWORD: ${TP_CH_INGEST_PASSWORD}
+      TP_CH_API_PASSWORD: ${TP_CH_API_PASSWORD}
+      TP_CH_MONITOR_PASSWORD: ${TP_CH_MONITOR_PASSWORD}
+    depends_on:
+      control-postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+
+  # Seeds the default fleet once (idempotent: skips tenants that have data),
+  # then starts their capture. `docker compose up` alone yields a working system.
+  bootstrap:
+    <<: *go
+    command: ["tpctl", "seed", "--tenants", "${SEED_TENANTS:-3}", "--rows", "${SEED_ROWS:-60000}"]
+    restart: "no"
+    volumes:
+      - ./bench/results:/results
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      source-postgres: { condition: service_healthy }
+
+  # Change capture: logical replication (pgoutput) -> ClickHouse. Scale out with
+  # more replicas: INGESTER_INDEX=0..N-1, INGESTER_COUNT=N (tenants hash-partitioned).
+  ingester:
+    <<: *go
+    command: ["ingester"]
+    environment:
+      <<: *go-env
+      INGESTER_INDEX: "0"
+      INGESTER_COUNT: "1"
+      INGEST_FLUSH_INTERVAL: ${INGEST_FLUSH_INTERVAL:-1s}
+      INGEST_FLUSH_ROWS: ${INGEST_FLUSH_ROWS:-50000}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      source-postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9100/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # Stateless: scale horizontally behind the web proxy.
+  api:
+    <<: *go
+    command: ["api"]
+    environment:
+      <<: *go-env
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      API_TENANT_CONCURRENCY: ${API_TENANT_CONCURRENCY:-16}
+      API_DB_CONCURRENCY: ${API_DB_CONCURRENCY:-64}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Benchmark-only twin of `api` (profile "compare"): same endpoints and auth,
+  # but every request queries the store's primary Postgres directly — no
+  # ClickHouse, no cache. Used by `tpctl stress` to measure the difference.
+  api-direct:
+    <<: *go
+    profiles: ["compare", "demo"]
+    command: ["api"]
+    environment:
+      <<: *go-env
+      API_BACKEND: direct
+      SOURCE_READ_DSN: postgres://tp_app:${TP_APP_PASSWORD}@source-postgres:5432/postgres?sslmode=disable
+      API_TENANT_CONCURRENCY: "64"
+      API_DB_CONCURRENCY: "160"
+    ports:
+      - "127.0.0.1:${API_DIRECT_PORT:-8090}:8080"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  # DEMO_MODE only. The API never holds source credentials.
+  demo:
+    <<: *go
+    profiles: ["demo"]
+    command: ["demo"]
+    environment:
+      <<: *go-env
+      DEMO_MODE: ${DEMO_MODE:-false}
+      API_DIRECT_URL: http://api-direct:8080
+      SOURCE_DEMO_DSN: postgres://tp_demo:${TP_DEMO_PASSWORD}@source-postgres:5432/postgres?sslmode=disable
+    ports:
+      - "127.0.0.1:${DEMO_PORT:-8081}:8081"
+    depends_on:
+      api: { condition: service_healthy }
+
+  web:
+    image: tenantpulse/web:dev
+    build:
+      context: ./client
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8088}:8080"
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  tpctl:
+    <<: *go
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["tpctl"]
+    command: ["help"]
+    volumes:
+      - ./bench/results:/results
+
+  # pgbench runs in its own container so client CPU is not charged to the source.
+  pgbench:
+    image: postgres:18.4-alpine
+    profiles: ["tools"]
+    restart: "no"
+    entrypoint: ["pgbench"]
+    environment:
+      PGHOST: source-postgres
+      PGUSER: tp_app
+      PGPASSWORD: ${TP_APP_PASSWORD}
+    volumes:
+      - ./bench/pgbench:/bench:ro
+      - ./bench/results:/results
+
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: ["tools"]
+    restart: "no"
+    environment:
+      BASE_URL: http://web:8080/api
+    volumes:
+      - ./bench/k6:/scripts:ro
+      - ./bench/results:/results
+
+  prometheus:
+    image: prom/prometheus:v3.7.0
+    profiles: ["obs"]
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+
+volumes:
+  source-pg:
+  control-pg:
+  clickhouse-data:

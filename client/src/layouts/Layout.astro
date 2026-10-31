@@ -1,0 +1,75 @@
+---
+import '../styles/global.css';
+interface Props {
+  title: string;
+  active: 'dashboard' | 'monitor';
+}
+const { title, active } = Astro.props;
+const nav = [
+  { href: '/', label: 'Dashboard', key: 'dashboard' },
+  { href: '/monitor', label: 'Monitor', key: 'monitor' },
+];
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="TenantPulse — fast, fresh, tenant-isolated commerce analytics" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title}</title>
+    <script is:inline>
+      try {
+        const t = localStorage.getItem('tp-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch {}
+    </script>
+  </head>
+  <body class="min-h-screen font-sans antialiased">
+    <header class="sticky top-0 z-40 border-b hairline backdrop-blur" style="background: color-mix(in srgb, var(--surface) 88%, transparent)">
+      <div class="mx-auto flex h-14 max-w-7xl items-center gap-6 px-4">
+        <a href="/" class="flex items-center gap-2 text-[15px] font-semibold tracking-tight">
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="1" y="1" width="22" height="22" rx="7" fill="var(--accent)"></rect>
+            <path d="M5 13h3l2-5 3 9 2-5h4" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+          TenantPulse
+        </a>
+        <nav class="flex h-full items-center gap-1 text-sm" aria-label="Main">
+          {nav.map((n) => (
+            <a
+              href={n.href}
+              class="relative flex h-full items-center px-2.5 font-medium"
+              style={n.key === active ? 'color: var(--ink)' : 'color: var(--ink-muted)'}
+              aria-current={n.key === active ? 'page' : undefined}
+            >
+              {n.label}
+              {n.key === active && <span class="absolute inset-x-2 -bottom-px h-0.5 rounded-full" style="background: var(--accent)"></span>}
+            </a>
+          ))}
+        </nav>
+        <div class="ml-auto flex items-center gap-2">
+          <slot name="header-right" />
+          <button id="theme" class="btn btn-ghost w-9 justify-center px-0" type="button" title="Switch light / dark theme" aria-label="Switch theme">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+    <main class="mx-auto max-w-7xl px-4 pt-5 pb-12">
+      <slot />
+    </main>
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+    <script>
+      document.getElementById('theme')?.addEventListener('click', () => {
+        const root = document.documentElement;
+        const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+        root.dataset.theme = dark ? 'light' : 'dark';
+        try {
+          localStorage.setItem('tp-theme', root.dataset.theme);
+        } catch {}
+        window.dispatchEvent(new Event('tp-theme'));
+      });
+    </script>
+  </body>
+</html>

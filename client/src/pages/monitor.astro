@@ -1,0 +1,103 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Info from '../components/Info.astro';
+const tiles = [
+  { id: 'p50', label: 'Query time · p50', tip: 'Half of all dashboard API reads in the last 60 s were answered faster than this (server time). Benchmark reads that deliberately skip the cache (stress test ClickHouse-only phase, Compare button) are counted separately.' },
+  { id: 'p95', label: 'Query time · p95', tip: '95% of dashboard API reads in the last 60 s were faster than this. Target: under 200 ms.' },
+  { id: 'p99', label: 'Query time · p99', tip: '99% of reads were faster than this: the slow tail, usually reads that had to be computed in ClickHouse.' },
+  { id: 'hit', label: 'Cache hit rate', tip: 'Share of reads answered from the in-memory cache. Each entry remembers the store data version it was computed at. When new data arrives, a read may get the previous answer (at most 5 s old) while the new one is computed in the background, so new data never sends every reader to ClickHouse at once. The dashboard auto-refresh always waits for the new version.' },
+  { id: 'eps', label: 'Events per second', tip: 'Row changes (inserts, updates, deletes) written into ClickHouse per second by the ingesters.' },
+  { id: 'lag', label: 'Worker lag', tip: 'Time from a change committing in a store database to being queryable in ClickHouse, for the newest change.' },
+];
+const charts = [
+  { id: 'c-rps', title: 'Requests per second', tip: 'Dashboard API reads per second over the last 60 seconds.' },
+  { id: 'c-p95', title: 'Query time p95', tip: 'Per-second 95th-percentile server time of dashboard reads.' },
+  { id: 'c-hit', title: 'Cache hit rate', tip: 'Per-second share of reads served from the cache.' },
+];
+---
+<Layout title="TenantPulse · Monitor" active="monitor">
+  <div slot="header-right" id="mon-state" class="chip"><span class="chip-dot" style="background: var(--ink-muted)"></span><span>Connecting…</span></div>
+
+  <div class="mb-4 flex flex-wrap items-end justify-between gap-2">
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">Pipeline monitor</h1>
+      <p class="muted text-xs">Live API latency, cache efficiency, ingestion throughput and per-store lag · last 60 seconds</p>
+    </div>
+    <span id="updated" class="muted text-xs tabnum"></span>
+  </div>
+
+  <section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6" aria-label="Key figures">
+    {tiles.map((t) => (
+      <div class="card px-4 py-3.5">
+        <div class="ink-2 flex items-center text-xs font-medium">{t.label}<Info align="left" text={t.tip} /></div>
+        <div id={`m-${t.id}`} class="skel mt-1.5 w-fit min-w-16 text-2xl font-semibold tracking-tight">—</div>
+        <div id={`m-${t.id}-sub`} class="muted mt-1 min-h-4 truncate text-[11px]"></div>
+      </div>
+    ))}
+  </section>
+
+  <section class="mt-4 grid gap-4 lg:grid-cols-3">
+    {charts.map((c) => (
+      <div class="card min-w-0 p-4">
+        <h2 class="card-title flex items-center">{c.title}<Info align="left" text={c.tip} /></h2>
+        <p id={`${c.id}-sub`} class="muted mb-2 text-xs"></p>
+        <div id={c.id} class="h-45"></div>
+      </div>
+    ))}
+  </section>
+
+  <section id="bench" class="card mt-4 min-w-0 p-4" aria-label="Direct database vs aggregation layer">
+    <h2 class="card-title flex items-center">Stress test: direct primary DB vs aggregation layer<Info align="left" text="Two API instances with identical endpoints and auth under the same load. api-direct runs every dashboard query on the store's primary Postgres; api uses ClickHouse plus the version-keyed cache (also shown with the cache bypassed). A fixed checkout workload runs on the primary during every phase, so the last columns show how much dashboard traffic slows the store." /></h2>
+    <div class="mb-3 flex flex-wrap items-center gap-2">
+      <p class="muted text-xs">Concurrent dashboard users hitting all four widgets for every store; latencies are p50 / p95 / p99 round trips</p>
+      <button id="stress-run" class="btn btn-primary ml-auto hidden" type="button" title="Read stress: 20 users hammer the dashboards with no pause. 4 phases of about 18 s.">▶ Run stress test</button>
+      <button id="writes-run" class="btn btn-primary hidden" type="button" title="Write storm: every store takes about 1,000 transactions/s in total while 100 dashboard viewers watch. 3 phases of about 25 s.">▶ Run write storm</button>
+    </div>
+    <div id="stress-progress" class="mb-4 hidden rounded-xl px-4 py-3" style="background: var(--surface-2)"></div>
+    <div id="bench-stress"><p class="muted text-sm">Loading…</p></div>
+    <h3 class="mt-6 mb-3 flex items-center text-sm font-semibold">Write storm: every store writing at once<Info align="left" text="All stores taking checkouts, status changes and cancellations at a high rate while dashboard viewers watch like the real page does. The CLI version (make bench-writes) adds a first phase with the analytics pipeline paused, the pure store baseline, and reports how fast the pipeline catches up afterwards." /></h3>
+    <div id="bench-writes"><p class="muted text-sm">Loading…</p></div>
+  </section>
+
+  <section class="card mt-4 min-w-0 p-4" aria-label="Single query ladder">
+    <h2 class="card-title flex items-center">Single-query ladder: tuning the primary vs ClickHouse<Info align="left" text="The same dashboard query at four optimization levels on the largest store, one at a time on an idle database: no index, the default B-tree index, covering indexes (best-case tuning of the primary), and ClickHouse. Covering indexes make every store write slower, which the stress test captures." /></h2>
+    <p class="muted mb-3 text-xs">What indexing the primary buys you, query by query</p>
+    <div id="bench-ladder"><p class="muted text-sm">Loading…</p></div>
+  </section>
+
+  <section class="mt-4 grid gap-4 lg:grid-cols-3">
+    <div class="card min-w-0 p-4 lg:col-span-2">
+      <h2 class="card-title flex items-center">Stores furthest behind<Info align="left" text="Data age: how old the newest store state shown on dashboards is. Apply lag: commit to queryable for the newest change. WAL retained: change log Postgres keeps until the ingester confirms it (should stay small)." /></h2>
+      <p class="muted mb-3 text-xs">Data age = how old the newest store state shown on dashboards is. Idle stores stay current through replication keepalives.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm tabnum">
+          <thead><tr class="muted border-b hairline text-left text-[11px] uppercase tracking-wide">
+            <th class="py-2 font-medium">Store</th><th class="py-2 font-medium">Size</th><th class="py-2 font-medium">Stream</th>
+            <th class="py-2 text-right font-medium">Data age</th><th class="py-2 text-right font-medium">Apply lag</th>
+            <th class="py-2 text-right font-medium">WAL retained</th><th class="py-2 text-right font-medium">Rows applied</th>
+          </tr></thead>
+          <tbody id="worst"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="flex min-w-0 flex-col gap-4">
+      <div class="card p-4">
+        <h2 class="card-title flex items-center">ClickHouse storage<Info align="right" text="Rows and on-disk size of each analytics table. Compression = uncompressed bytes divided by bytes on disk." /></h2>
+        <table class="mt-2 w-full text-sm tabnum">
+          <thead><tr class="muted border-b hairline text-left text-[11px] uppercase tracking-wide">
+            <th class="py-2 font-medium">Table</th><th class="py-2 text-right font-medium">Rows</th><th class="py-2 text-right font-medium">On disk</th><th class="py-2 text-right font-medium">Compression</th>
+          </tr></thead>
+          <tbody id="store"></tbody>
+        </table>
+      </div>
+      <div class="card p-4">
+        <h2 class="card-title flex items-center">Ingesters<Info align="right" text="Each ingester streams the change log of the stores assigned to it and writes batches to ClickHouse. Add more ingesters to scale out." /></h2>
+        <div id="ingesters" class="mt-2 space-y-2 text-xs"></div>
+      </div>
+    </div>
+  </section>
+</Layout>
+
+<script>
+  import '../scripts/monitor';
+</script>

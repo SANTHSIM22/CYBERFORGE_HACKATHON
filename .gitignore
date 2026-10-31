@@ -1,0 +1,12 @@
+.env
+*.exe
+server/tpctl
+server/api
+server/aggregator
+server/demo
+client/node_modules/
+client/dist/
+client/.astro/
+bench/results/*
+!bench/results/.gitkeep
+.DS_Store

@@ -1,0 +1,9 @@
+---
+// Small "i" button that explains a widget on hover or keyboard focus.
+interface Props {
+  text: string;
+  align?: 'center' | 'left' | 'right';
+}
+const { text, align = 'center' } = Astro.props;
+---
+<button type="button" class="info" data-tip={text} data-align={align} aria-label={text}>i</button>

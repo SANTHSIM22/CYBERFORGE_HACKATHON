@@ -1,0 +1,180 @@
+---
+import Layout from '../layouts/Layout.astro';
+import Info from '../components/Info.astro';
+const kpis = [
+  { id: 'orders', label: 'Orders', tip: 'Orders created in the selected range: any status, any currency, deleted orders excluded. The badge compares with the same-length period right before.' },
+  { id: 'gross', label: 'Gross sales', tip: 'Sum of order totals in the selected currency for every order created in the range, including pending, cancelled and refunded orders.' },
+  { id: 'recognized', label: 'Recognized sales', tip: 'Revenue the store keeps: orders that are placed, paid, processing, shipped or delivered. Pending, cancelled and refunded orders are excluded.' },
+  { id: 'aov', label: 'Average order value', tip: 'Gross sales divided by the number of orders, in the selected currency.' },
+];
+---
+<Layout title="TenantPulse" active="dashboard">
+  <div slot="header-right" class="flex items-center">
+    <div id="fresh" class="chip" aria-live="polite"><span class="chip-dot" style="background: var(--ink-muted)"></span><span>Connecting…</span></div>
+    <Info align="right" text="How recent the newest store data on this page is. A new order shows up about a second after it commits; idle stores are re-checked every second." />
+  </div>
+
+  <!-- Page header + filters (one row; they scope everything below) -->
+  <section class="mb-4 flex flex-wrap items-end justify-between gap-3" aria-label="Filters">
+    <div class="min-w-0">
+      <div class="mb-1 flex items-center"><label for="tenant" class="muted block text-[11px] font-medium uppercase tracking-wide">Store</label><Info align="left" text="Each store is a tenant with its own database. Picking a store signs you in as that store, so you only ever see its data." /></div>
+      <div class="flex flex-wrap items-center gap-2">
+        <select id="tenant" class="h-10 max-w-[20rem] text-sm font-semibold"></select>
+        <span id="tenant-tier" class="chip"></span>
+        <span id="tz" class="muted text-xs"></span>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <div class="seg" id="range" role="group" aria-label="Date range">
+        <button type="button" data-range="today">Today</button>
+        <button type="button" data-range="7d" aria-pressed="true">7D</button>
+        <button type="button" data-range="30d">30D</button>
+        <button type="button" data-range="90d">90D</button>
+        <button type="button" data-range="custom">Custom</button>
+      </div>
+      <form id="custom" class="hidden items-center gap-1.5 text-xs">
+        <input type="date" id="from" aria-label="From date" required />
+        <span class="muted">→</span>
+        <input type="date" id="to" aria-label="To date (inclusive)" required />
+        <button class="btn btn-primary" type="submit">Apply</button>
+      </form>
+      <label class="sr-only" for="currency">Currency</label>
+      <select id="currency" aria-label="Currency"></select>
+      <Info align="right" text="Ranges are whole days in the store timezone (7D = today plus the 6 days before). Sales are shown per currency and never added across currencies; order counts include every currency." />
+    </div>
+  </section>
+
+  <!-- Live demo (only when the DEMO_MODE service is running) -->
+  <section id="demo" class="card mb-4 hidden flex-wrap items-center gap-2 px-4 py-3" style="border-left: 3px solid var(--accent)" aria-label="Live demo">
+    <div class="mr-2">
+      <div class="text-[11px] font-semibold uppercase tracking-wide" style="color: var(--accent)">Live demo</div>
+      <div class="muted flex items-center text-[11px]">Writes go to the store's own database<Info align="left" text="Add or Cancel writes a real change into this store's database. It flows through logical replication, the ingester and ClickHouse, and appears here about a second later (the toast shows how long). Compare runs the same question directly on the store database and on ClickHouse. Cross-tenant read proves one store cannot read another." /></div>
+    </div>
+    <button id="add-order" class="btn btn-primary" type="button">＋ Add random order</button>
+    <button id="cancel-order" class="btn" type="button">Cancel an order</button>
+    <span class="mx-1 hidden h-6 w-px sm:block" style="background: var(--ring)"></span>
+    <select id="compare-kind" aria-label="Query to compare">
+      <option value="summary">Totals</option>
+      <option value="breakdown">Status breakdown</option>
+      <option value="trends">Trend</option>
+      <option value="top">Top 10 products</option>
+    </select>
+    <button id="compare" class="btn" type="button">⚖ Compare with direct SQL</button>
+    <span class="mx-1 hidden h-6 w-px sm:block" style="background: var(--ring)"></span>
+    <button id="isolation" class="btn" type="button" title="Use this store's token to read another store">🔒 Try cross-tenant read</button>
+  </section>
+
+  <div id="notready" class="card mb-4 hidden px-4 py-3 text-sm" role="status"></div>
+
+  <!-- KPI cards -->
+  <section class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4" id="kpis" aria-label="Key figures">
+    {kpis.map((k) => (
+      <div class="card flex flex-col px-4 pt-3.5 pb-2.5">
+        <div class="flex items-center justify-between gap-2">
+          <span class="ink-2 flex items-center text-xs font-medium">{k.label}<Info align="left" text={k.tip} /></span>
+          <span id={`kpi-${k.id}-delta`} class="chip hidden"></span>
+        </div>
+        <div id={`kpi-${k.id}`} class="skel mt-1.5 w-fit min-w-24 truncate text-[28px] leading-9 font-semibold tracking-tight">—</div>
+        <div id={`kpi-${k.id}-sub`} class="muted mt-1 min-h-4 truncate text-[11px]"></div>
+        <div id={`kpi-${k.id}-spark`} class="mt-2 h-8"></div>
+      </div>
+    ))}
+  </section>
+  <div class="mt-2 mb-4 flex flex-wrap items-center gap-2 text-[11px]">
+    <span id="lat-summary" class="chip"></span>
+    <span id="period" class="muted"></span>
+    <Info align="left" text="Every widget shows how it was answered. Served from cache = repeat view of unchanged data (well under a millisecond). Computed in ClickHouse = first view after new data arrived. From cache · refreshing = the previous answer (at most 5 s old) while the new one is computed; the widget updates a second later. The dashboard never queries the store database." />
+  </div>
+
+  <section class="grid gap-4 lg:grid-cols-3">
+    <div class="card min-w-0 p-4 lg:col-span-2" id="trend-card">
+      <div class="mb-1 flex flex-wrap items-start gap-2">
+        <div class="mr-auto min-w-0">
+          <div class="flex items-center"><h2 id="trend-title" class="card-title">Trend</h2><Info align="left" text="Orders or sales per day (store timezone) or per hour, for the selected range and currency. Hover the chart for exact values, or switch to Table for every number." /></div>
+          <p id="trend-sub" class="muted text-xs"></p>
+        </div>
+        <div class="seg" id="metric" role="group" aria-label="Trend metric">
+          <button type="button" data-metric="orders" aria-pressed="true">Orders</button>
+          <button type="button" data-metric="gross">Gross</button>
+          <button type="button" data-metric="recognized">Recognized</button>
+        </div>
+        <div class="seg" id="grain" role="group" aria-label="Bucket size">
+          <button type="button" data-grain="day" aria-pressed="true">Daily</button>
+          <button type="button" data-grain="hour">Hourly</button>
+        </div>
+        <div class="seg" role="group" aria-label="View">
+          <button type="button" id="view-chart" aria-pressed="true">Chart</button>
+          <button type="button" id="view-table" aria-pressed="false">Table</button>
+        </div>
+      </div>
+      <div id="trend-chart" class="mt-2 h-70 w-full"></div>
+      <div id="trend-table" class="mt-2 hidden max-h-70 overflow-auto"></div>
+      <div class="mt-2"><span id="lat-trends" class="chip"></span></div>
+    </div>
+
+    <div class="card flex min-w-0 flex-col p-4">
+      <div class="flex items-center"><h2 class="card-title">Orders by status</h2><Info align="right" text="The current status of every order created in the range. Blue statuses count toward recognized sales; orange ones (pending, cancelled, refunded) do not." /></div>
+      <p class="muted text-xs">Current status of orders created in the range</p>
+      <div id="status-stack" class="mt-3 flex h-2.5 w-full overflow-hidden rounded-full" style="background: var(--surface-2)"></div>
+      <div class="ink-2 mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+        <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2.5 w-2.5 rounded-sm" style="background: var(--series-1)"></span>Counts toward recognized sales</span>
+        <span class="inline-flex items-center gap-1.5"><span class="inline-block h-2.5 w-2.5 rounded-sm" style="background: var(--series-2)"></span>Excluded</span>
+      </div>
+      <div id="status-bars" class="mt-3 flex-1 space-y-2"></div>
+      <div class="mt-3"><span id="lat-breakdown" class="chip"></span></div>
+    </div>
+  </section>
+
+  <section class="card mt-4 min-w-0 p-4">
+    <div class="mb-3 flex flex-wrap items-baseline gap-x-2">
+      <h2 class="card-title flex items-center">Top 10 products<Info align="left" text="Products ranked by line revenue (quantity x unit price) from recognized orders in the selected currency. Taxes and shipping are not included, so this differs from gross sales." /></h2>
+      <span class="muted text-xs">by recognized line revenue (quantity × unit price)</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="muted border-b hairline text-left text-[11px] uppercase tracking-wide">
+            <th class="w-10 py-2 font-medium">#</th>
+            <th class="py-2 font-medium">Product</th>
+            <th class="py-2 pr-6 text-right font-medium">Units</th>
+            <th class="py-2 pr-6 text-right font-medium">Revenue</th>
+            <th class="hidden w-56 py-2 font-medium sm:table-cell">Share of top 10</th>
+          </tr>
+        </thead>
+        <tbody id="top-body"></tbody>
+      </table>
+    </div>
+    <div class="mt-3"><span id="lat-top" class="chip"></span></div>
+  </section>
+
+  <section id="bench-card" class="card mt-4 min-w-0 p-4" aria-label="Direct database vs aggregation layer">
+    <div class="mb-1 flex flex-wrap items-center gap-2">
+      <h2 class="card-title flex items-center">Direct primary DB vs this aggregation layer<Info align="left" text="Latest stress test: two API instances with identical endpoints under the same concurrent load. One queries each store's primary Postgres on every request; the other uses ClickHouse plus the version-keyed cache. Store checkout traffic runs on the primary throughout, so you also see how much each slows the store down." /></h2>
+      <div class="ml-auto flex items-center gap-3">
+        <a href="/monitor#bench" class="text-xs font-medium" style="color: var(--accent)">Full results →</a>
+        <button id="stress-run" class="btn btn-primary hidden" type="button" title="Read stress: 20 users hammer the dashboards with no pause while stores take light traffic. 4 phases of about 18 s: baseline, direct primary DB, aggregation layer, ClickHouse only.">▶ Run stress test</button>
+        <button id="writes-run" class="btn btn-primary hidden" type="button" title="Write storm: every store takes about 1,000 transactions/s in total (checkouts, status changes, cancellations) while 100 dashboard viewers watch. 3 phases of about 25 s.">▶ Run write storm</button>
+      </div>
+    </div>
+    <p class="muted mb-3 text-xs">Same questions, same data, same load: how fast dashboards answer, and what it costs the store's database</p>
+    <div id="stress-progress" class="mb-4 hidden rounded-xl px-4 py-3" style="background: var(--surface-2)"></div>
+    <div id="bench-stress"><p class="muted text-sm">Loading benchmark…</p></div>
+    <h3 class="mt-6 mb-3 flex items-center text-sm font-semibold">Write storm: every store writing at once<Info align="left" text="The other real-world stress: all stores taking orders, status changes and cancellations at a high rate while people watch their dashboards. Shows how much the stores slow down, how fast a new order reaches the dashboard, and dashboard speed, with dashboards on this layer and, for contrast, on the store databases." /></h3>
+    <div id="bench-writes"><p class="muted text-sm">Loading…</p></div>
+  </section>
+
+  <dialog id="compare-dialog" class="card m-auto w-[min(48rem,calc(100vw-2rem))] p-0" style="color: var(--ink)">
+    <div class="flex items-center gap-2 border-b hairline px-5 py-3.5">
+      <div>
+        <h2 class="card-title">Aggregation layer vs. direct SQL</h2>
+        <p class="muted text-xs">Same question, same moment: the store database vs. ClickHouse</p>
+      </div>
+      <form method="dialog" class="ml-auto"><button class="btn" aria-label="Close">Close</button></form>
+    </div>
+    <div id="compare-body" class="max-h-[75vh] overflow-auto px-5 py-4 text-sm"></div>
+  </dialog>
+</Layout>
+
+<script>
+  import '../scripts/dashboard';
+</script>

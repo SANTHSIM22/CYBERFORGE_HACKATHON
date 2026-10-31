@@ -1,0 +1,40 @@
+{
+  "title": "TenantPulse",
+  "uid": "tenantpulse",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries", "title": "API latency p50 / p95 / p99 (s)", "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(tenantpulse_api_request_duration_seconds_bucket[1m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(tenantpulse_api_request_duration_seconds_bucket[1m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(tenantpulse_api_request_duration_seconds_bucket[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Cache results / s", "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [ { "expr": "sum by (result) (rate(tenantpulse_cache_requests_total[1m]))", "legendFormat": "{{result}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "CDC events applied / s", "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [ { "expr": "rate(tenantpulse_events_processed_total[1m])", "legendFormat": "events/s" } ]
+    },
+    {
+      "type": "timeseries", "title": "Kafka consumer lag (records)", "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [ { "expr": "tenantpulse_kafka_consumer_lag", "legendFormat": "lag" } ]
+    },
+    {
+      "type": "timeseries", "title": "Aggregation transaction p95 (s)", "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [ { "expr": "histogram_quantile(0.95, sum by (le) (rate(tenantpulse_aggregation_batch_duration_seconds_bucket[1m])))", "legendFormat": "p95" } ]
+    },
+    {
+      "type": "timeseries", "title": "DLQ records / cache invalidation failures", "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "increase(tenantpulse_dlq_records_total[5m])", "legendFormat": "dlq" },
+        { "expr": "increase(tenantpulse_cache_invalidation_failures_total[5m])", "legendFormat": "invalidation failures" }
+      ]
+    }
+  ]
+}
