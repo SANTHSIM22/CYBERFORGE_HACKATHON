@@ -144,7 +144,7 @@ sequenceDiagram
     Ing->>CH: publish the store's new data_version (+ freshness time)
     Ing-->>Store: confirm: received up to this point
     API->>CH: every 250 ms: read data versions of all stores (one tiny query)
-    Dash->>API: every 1 s: "freshness?" (answered from memory)
+    API-->>Dash: freshness stream pushes the new version (no polling)
     Dash->>API: version changed → reload widgets (min_version = new version)
     API->>CH: store's view syncs: read only cells written since last time
     API-->>Dash: answers computed in memory (microseconds)
@@ -187,9 +187,16 @@ sequenceDiagram
 6. **Only now** does the ingester tell Postgres "received up to here". If anything
    crashed before this, Postgres re-sends, and step 4 makes the re-send harmless.
 7. **The API notices** the new version on its next 250 ms poll.
-8. **The dashboard notices** on its next freshness poll (every second, answered
-   from the API's memory), reloads its four widgets and asks for "at least this
-   version" so it can never show data older than its freshness badge.
+8. **The dashboard is told.** Each open dashboard holds one streamed response
+   (`/stream`, Server-Sent Events). The API pushes an event on it right after
+   the poll that saw the new version, and otherwise only when the pipeline's
+   health changes (live, lagging, stalled). With no changes nothing is sent
+   but an invisible keepalive comment every 20 s. The dashboard reloads its
+   four widgets and asks for "at least this version" so it can never show
+   data older than its freshness badge. The badge reads "Live · last change
+   4m ago": the time since the store's last real change, counted in the
+   browser. If the stream cannot be opened (a proxy that blocks streaming,
+   for example), the page polls `/freshness` every second instead.
 9. **The API answers from memory.** Its in-memory view of the store reads only
    the rollup cells written since its last sync (a few rows) and computes the
    answer in microseconds.
@@ -239,12 +246,17 @@ last 30 days".
    range with exact times, 365-day top products, half-hour timezones at hour
    grain) is one ClickHouse query that reads whole calendar months from the
    product-month cells, whole days and hours from their rollups, and raw rows
-   only for partial hours at the edges.
+   only for partial hours at the edges. Each table is read once, with all of
+   its time ranges combined (a `FINAL` read costs about 10 ms however few rows
+   it reads, so one read per range made an exact-time summary 14 reads).
 8. **Limits.** At most N ClickHouse queries run per store and in total. A
    reader waits up to 1 s for a slot, then gets `429 Retry-After`. Background
    refreshes may use only half the slots, so readers always have the other half.
-9. **The response** says how it was answered (`meta.cache`, `took_ms`,
-   `data_version`) and each widget shows that on screen.
+9. **The response** says how it was answered: `meta.cache` (`HIT`, `STALE`,
+   `MISS`, `BYPASS`), `meta.source` (what computed it: `view` for the
+   in-memory copy, `clickhouse` for a query), `took_ms` and `data_version`.
+   Each widget shows that on screen ("served from cache", "computed in
+   memory", "computed in ClickHouse").
 
 Why both a cache and views? The cache makes repeat reads free. The views make
 the *first* read after new data nearly free and turn "every widget × every
@@ -278,7 +290,7 @@ tiny delta read per store per change".
 | **Data versions** instead of time-based expiry | A cached answer is tied to the exact data it came from, so it is never silently wrong | One tiny status query every 250 ms per API copy |
 | **Stale-while-revalidate (5 s)** | When data changes, readers get the previous answer instantly while one background query refreshes it, instead of everyone waiting on ClickHouse at once | Data shown can be up to 5 s behind (the target is < 30 s); dashboards that already know a newer version wait for it |
 | **In-memory views** | ClickHouse work follows data changes, not viewers × widgets × ranges | Memory: about 0.5 MB for the largest store; anything unusual falls back to ClickHouse |
-| **Freshness answered from memory** | Every open dashboard polls freshness each second; a database query per poll would grow with viewers | None |
+| **Freshness pushed, not polled** | One query every 250 ms tells the API every store's data version and pipeline health; each open dashboard holds one stream and gets an event only when its store's data or health changes. Polling cost one HTTP request per viewer per second | Each stream holds a connection; nginx allows 8,192 per worker. CPU for 2,000 open dashboards is measured in [RESULTS.md](RESULTS.md); nothing reaches ClickHouse either way |
 | **Exported snapshot for new stores** | The first full copy and the live stream start at exactly the same point: no gap, no duplicate | Interrupted snapshots are redone from scratch |
 | **Database per store** | Strong isolation, simple per-store backup and moves | More databases to manage (automated by the control plane) |
 
@@ -367,7 +379,7 @@ service has its own least-privilege database role.
 | Many stores write at the same time (write storm) | The ingester batches all stores into one insert per table per second; each store's data version bumps at most once a second; each API view reads only the changed cells. See the write-storm results. |
 | A burst of first views (just after an API restart) | Views load each store once (a few thousand rows); limits queue the rest; readers wait up to 1 s, then get a 429 with Retry-After |
 | Someone hammers the API | Per-store and global query limits protect ClickHouse; cache hits never use a slot |
-| The dashboard is opened in many tabs | Freshness polls are answered from memory; widget reloads hit the cache |
+| The dashboard is opened in many tabs | Each visible tab holds one freshness stream, answered from memory (hidden tabs close theirs); widget reloads hit the cache |
 
 ### Failures
 
@@ -404,7 +416,7 @@ service has its own least-privilege database role.
 | View answer | Sum a few hundred to a few thousand in-memory cells | 0.05–1 ms |
 | View sync after new data | One ClickHouse read of the cells written since last sync | ~5 ms, once per store per change |
 | ClickHouse fallback query | Reads rollups for whole days/hours | 7–20 ms on this laptop |
-| Checkout → dashboard | Batching (≤ 1 s) + rollup refresh + version poll (≤ 250 ms) + dashboard poll (≤ 1 s) | about 1 s |
+| Checkout → dashboard | Batching (≤ 1 s) + rollup refresh + version poll (≤ 250 ms) + stream push | about 1–2 s |
 
 Each ClickHouse query costs about 5 ms of fixed overhead on this laptop (even
 `SELECT 1` takes 1.6 ms), so the design minimizes the *number* of queries:
@@ -580,6 +592,7 @@ Windows without `make`: `.\tp.ps1 <target>` with the same names.
 Useful settings (`.env`): `INGEST_FLUSH_INTERVAL` (batching, default 1 s),
 `INGEST_VERSION_EVERY` (how often a store's data version may change, 1 s),
 `API_CACHE_STALE` (5 s), `API_VIEWS` (in-memory views on/off),
+`API_STREAM_KEEPALIVE` (keepalive comment on an idle freshness stream, 20 s),
 `API_TENANT_CONCURRENCY` and `API_DB_CONCURRENCY` (query limits),
 `API_LIMIT_WAIT` (1 s), `DEMO_MODE`.
 

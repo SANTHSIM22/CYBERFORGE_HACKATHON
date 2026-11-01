@@ -4,13 +4,15 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"tenantpulse/internal/chq"
 )
 
 func TestRespCacheStaleWhileRevalidate(t *testing.T) {
 	c := NewRespCache(100, time.Minute, 5*time.Second)
-	c.Put("k", 7, []byte("v7"))
+	c.Put("k", 7, answer{body: []byte("v7")})
 
-	if b, at, fresh, ok := c.Get("k", 7, 0); !ok || !fresh || at != 7 || string(b) != "v7" {
+	if a, at, fresh, ok := c.Get("k", 7, 0); !ok || !fresh || at != 7 || string(a.body) != "v7" {
 		t.Fatalf("current version: got ok=%v fresh=%v at=%d", ok, fresh, at)
 	}
 	// New data arrived (version 8): the previous answer is served as stale.
@@ -22,16 +24,16 @@ func TestRespCacheStaleWhileRevalidate(t *testing.T) {
 		t.Fatal("min_version must reject an older entry")
 	}
 	// An older, slower computation never replaces a newer answer.
-	c.Put("k", 9, []byte("v9"))
-	c.Put("k", 8, []byte("v8"))
-	if b, at, fresh, _ := c.Get("k", 9, 0); !fresh || at != 9 || string(b) != "v9" {
-		t.Fatalf("newer entry replaced: at=%d body=%s", at, b)
+	c.Put("k", 9, answer{body: []byte("v9")})
+	c.Put("k", 8, answer{body: []byte("v8")})
+	if a, at, fresh, _ := c.Get("k", 9, 0); !fresh || at != 9 || string(a.body) != "v9" {
+		t.Fatalf("newer entry replaced: at=%d body=%s", at, a.body)
 	}
 }
 
 func TestRespCacheStaleWindowExpires(t *testing.T) {
 	c := NewRespCache(100, time.Minute, 5*time.Second)
-	c.Put("k", 1, []byte("v1"))
+	c.Put("k", 1, answer{body: []byte("v1")})
 	c.mu.Lock()
 	e := c.entries["k"]
 	e.at = time.Now().Add(-6 * time.Second)
@@ -44,7 +46,7 @@ func TestRespCacheStaleWindowExpires(t *testing.T) {
 		t.Fatal("an entry at the current version is fresh regardless of the stale window")
 	}
 	disabled := NewRespCache(100, time.Minute, 0)
-	disabled.Put("k", 1, []byte("v1"))
+	disabled.Put("k", 1, answer{body: []byte("v1")})
 	if _, _, _, ok := disabled.Get("k", 2, 0); ok {
 		t.Fatal("stale window 0 disables stale serving")
 	}
@@ -106,10 +108,10 @@ func TestLimiterBackgroundKeepsHalfFree(t *testing.T) {
 func TestWindowExcludesBenchmarkProbes(t *testing.T) {
 	var w Window
 	now := time.Now()
-	w.Observe(now, 0.1, "HIT")
-	w.Observe(now, 0.2, "STALE")
-	w.Observe(now, 20, "MISS")
-	w.Observe(now, 400, "BYPASS")
+	w.Observe(now, 0.1, "HIT", "view")
+	w.Observe(now, 0.2, "STALE", "view")
+	w.Observe(now, 20, "MISS", "clickhouse")
+	w.Observe(now, 400, "BYPASS", "clickhouse")
 	st := w.Stats(now, 60)
 	if st.Requests != 3 || st.All.Count != 3 || st.Probes.Count != 1 {
 		t.Fatalf("requests=%d all=%d probes=%d", st.Requests, st.All.Count, st.Probes.Count)
@@ -129,10 +131,10 @@ func TestWindowWeighsEveryRequest(t *testing.T) {
 	var w Window
 	now := time.Now()
 	for range 3000 {
-		w.Observe(now.Add(-time.Second), 0.5, "HIT")
+		w.Observe(now.Add(-time.Second), 0.5, "HIT", "view")
 	}
 	for range 20 {
-		w.Observe(now, 300, "MISS")
+		w.Observe(now, 300, "MISS", "clickhouse")
 	}
 	st := w.Stats(now, 60)
 	if st.Requests != 3020 {
@@ -143,5 +145,89 @@ func TestWindowWeighsEveryRequest(t *testing.T) {
 	}
 	if st.Database.P50 < 294 || st.Database.P50 > 306 {
 		t.Fatalf("db p50=%v, want ~300 ms", st.Database.P50)
+	}
+}
+
+// Misses are split by what computed them, so a fast in-memory answer is never
+// reported as a ClickHouse query (and does not hide slow ones).
+func TestWindowSplitsMissesBySource(t *testing.T) {
+	var w Window
+	now := time.Now()
+	for range 90 {
+		w.Observe(now, 0.4, "MISS", "view")
+	}
+	for range 10 {
+		w.Observe(now, 120, "MISS", "clickhouse")
+	}
+	w.Observe(now, 0.05, "HIT", "clickhouse") // hits count as cache hits whatever computed them
+	st := w.Stats(now, 60)
+	if st.Database.Count != 100 || st.View.Count != 90 || st.ClickHouse.Count != 10 {
+		t.Fatalf("misses=%d view=%d clickhouse=%d", st.Database.Count, st.View.Count, st.ClickHouse.Count)
+	}
+	if st.ClickHouse.P50 < 117 || st.ClickHouse.P50 > 123 || st.View.P99 > 0.42 {
+		t.Fatalf("clickhouse p50=%v view p99=%v", st.ClickHouse.P50, st.View.P99)
+	}
+}
+
+// A poll wakes the streams of the stores whose data changed, and only those.
+func TestRespCacheChangedWakesOnlyThatStore(t *testing.T) {
+	c := NewRespCache(100, time.Minute, time.Second)
+	st := func(v uint64) chq.Status { return chq.Status{Found: true, SnapshotState: "completed", DataVersion: v} }
+	c.publish(map[string]uint64{"a:1": 1, "b:1": 1}, nil, map[string]chq.Status{"a:1": st(1), "b:1": st(1)})
+	a1, a2, b := c.Changed("a", 1), c.Changed("a", 1), c.Changed("b", 1)
+	c.publish(map[string]uint64{"a:1": 2, "b:1": 1}, nil, map[string]chq.Status{"a:1": st(2), "b:1": st(1)})
+	for _, ch := range []<-chan struct{}{a1, a2} {
+		select {
+		case <-ch:
+		default:
+			t.Fatal("a new data version must wake every stream of that store")
+		}
+	}
+	select {
+	case <-b:
+		t.Fatal("an unchanged store's streams must stay asleep")
+	default:
+	}
+	select {
+	case <-c.Changed("a", 1):
+		t.Fatal("after waking, a store's next signal must wait for its next change")
+	default:
+	}
+}
+
+// With no new data, a store's streams wake only when its pipeline health
+// changes, including when the clock alone makes it "stalled" while ClickHouse
+// cannot be polled.
+func TestRespCacheWakesOnHealthChange(t *testing.T) {
+	c := NewRespCache(100, time.Minute, time.Second)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	checked := now.Add(-20 * time.Second)
+	st := chq.Status{Found: true, SnapshotState: "completed", DataVersion: 1, StreamCheckedAt: &checked}
+	c.publish(map[string]uint64{"a:1": 1}, nil, map[string]chq.Status{"a:1": st})
+	quiet := c.Changed("a", 1)
+	c.publish(map[string]uint64{"a:1": 1}, nil, map[string]chq.Status{"a:1": st}) // same data, still live
+	select {
+	case <-quiet:
+		t.Fatal("no new data and unchanged health must not wake the stream")
+	default:
+	}
+	now = now.Add(15 * time.Second) // last confirmation now 35 s old
+	c.publish(nil, nil, nil)        // the poll failed: only the clock moved
+	select {
+	case <-quiet:
+	default:
+		t.Fatal("a pipeline that stopped confirming must wake its streams as stalled")
+	}
+	if h := pipelineHealth(st, now); h != "stalled" {
+		t.Fatalf("health=%s, want stalled", h)
+	}
+}
+
+func TestRespCacheKeepsSource(t *testing.T) {
+	c := NewRespCache(100, time.Minute, 5*time.Second)
+	c.Put("k", 3, answer{[]byte("v3"), "view"})
+	if a, _, _, ok := c.Get("k", 3, 0); !ok || a.source != "view" {
+		t.Fatalf("source lost: ok=%v source=%q", ok, a.source)
 	}
 }

@@ -1,4 +1,4 @@
-import { ApiError, demo, demoAvailable, get, subjects, type Envelope, type Subject } from '../lib/api';
+import { ApiError, demo, demoAvailable, get, stream, subjects, type Envelope, type Subject } from '../lib/api';
 import { $, ago, compactNum, cssVar, currencySymbol, el, int, money, ms, pct, toast } from '../lib/format';
 import { compactTick, lineChart, sparkline, type ChartHandle } from '../lib/charts';
 import { loadBench, READ_TEST, renderStress, renderWrites, wireStressButtons, WRITE_TEST } from '../lib/bench';
@@ -12,7 +12,7 @@ type StatusRow = { status: string; orders: number; recognized: boolean };
 type Breakdown = { statuses: StatusRow[]; total_orders: number };
 type Product = { rank: number; product_id: string; name: string; sku: string | null; quantity: string; revenue: string };
 type Top = { products: Product[]; currency: string };
-type Fresh = { status: string; data_as_of: string | null; data_version: string; server_time: string; snapshot_state: string };
+type Fresh = { tenant: string; status: string; data_as_of: string | null; last_source_commit_at: string | null; data_version: string; server_time: string; snapshot_state: string };
 type TenantInfo = { slug: string; name: string; tier: string; status: string; timezone: string; default_currency: string; currencies: string[] };
 type Metric = 'orders' | 'gross' | 'recognized';
 
@@ -61,9 +61,12 @@ function latency(id: string, env: { meta: Envelope<unknown>['meta']; rttMs: numb
   if (c === 'STALE') state.sawStale = true;
   const dot = el('span', 'chip-dot');
   dot.style.background = `var(${hit ? '--good' : '--series-3'})`;
-  const how = c === 'HIT' ? 'served from cache' : c === 'STALE' ? 'from cache · refreshing' : c === 'MISS' ? 'computed in ClickHouse' : 'cache bypassed';
+  const computed = env.meta.source === 'view' ? 'computed in memory' : 'computed in ClickHouse';
+  const how = c === 'HIT' ? 'served from cache' : c === 'STALE' ? 'from cache · refreshing' : c === 'MISS' ? computed : 'cache bypassed';
   n.replaceChildren(dot, el('span', 'tabnum', `${ms(env.meta.took_ms)} · ${how}`));
-  n.title = `Server time ${ms(env.meta.took_ms)} · browser round trip ${ms(env.rttMs)} · data version ${env.meta.data_version}`;
+  const origin = env.meta.source === 'view' ? 'in-memory rollups' : env.meta.source === 'clickhouse' ? 'ClickHouse' : '';
+  n.title = `Server time ${ms(env.meta.took_ms)} · browser round trip ${ms(env.rttMs)} · data version ${env.meta.data_version}`
+    + (origin ? ` · computed from ${origin}` : '');
 }
 
 // ------------------------------------------------------------------ init
@@ -131,7 +134,7 @@ async function init() {
       subject(),
       reloadBench,
     );
-  poll();
+  watch();
   window.addEventListener('tp-theme', () => {
     state.chartKey = '';
     renderTrend();
@@ -164,6 +167,7 @@ function markRange() {
 async function selectTenant(slug: string) {
   state.slug = slug;
   state.version = '';
+  watching?.abort(); // reopen the freshness stream for the new store
   state.firstLoad = true;
   syncURL();
   try {
@@ -505,36 +509,75 @@ async function loadTop() {
   latency('lat-top', env);
 }
 
-// ------------------------------------------------------------------ freshness polling
+// ------------------------------------------------------------------ freshness
 
 let skew = 0;
 let lastFresh: Fresh | null = null;
+let watching: AbortController | null = null;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function poll() {
+// The API pushes the store's freshness over one streamed response only when
+// something changes: new data, or the pipeline's health (live, lagging,
+// stalled). With no changes nothing arrives but an invisible keepalive, so an
+// open dashboard sends no requests and receives no events. Hidden tabs hold no
+// stream. If the stream cannot be opened, the page polls /freshness every
+// second for 30 s, then tries the stream again.
+async function watch() {
+  setInterval(() => renderFresh(lastFresh), 1000); // "last change N ago" ticks locally, no network
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) watching?.abort();
+  });
   for (;;) {
-    if (!document.hidden && state.slug) {
-      try {
-        const f = await get<Fresh>(`/v1/tenants/${state.slug}/freshness`, subject());
-        skew = Date.parse(f.server_time) - Date.now();
-        lastFresh = f;
-        if (f.data_version !== state.version || state.sawStale) {
-          const first = state.version === '';
-          state.version = f.data_version;
-          if (!first || state.sawStale) {
-            await refresh();
-            if (state.pending) {
-              const took = (performance.now() - state.pending.t0) / 1000;
-              toast(`${state.pending.label} is on the dashboard ${took.toFixed(2)} s after commit`, 'good', 9000);
-              state.pending = null;
-            }
-          }
-        }
-      } catch {
-        lastFresh = null;
-      }
-      renderFresh(lastFresh);
+    if (document.hidden || !state.slug) {
+      await sleep(500);
+      continue;
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    const slug = state.slug;
+    const ctl = new AbortController();
+    watching = ctl;
+    let opened = false;
+    try {
+      await stream<Fresh>(`/v1/tenants/${slug}/stream`, subject(), ctl.signal, () => (opened = true), onFresh);
+    } catch {
+      // network error, API restart, or aborted (store switched, tab hidden)
+    }
+    if (ctl.signal.aborted) continue;
+    if (opened) {
+      await sleep(1000); // the stream ended (e.g. API restart): reconnect
+      continue;
+    }
+    for (const until = Date.now() + 30_000; Date.now() < until && slug === state.slug && !document.hidden; ) {
+      await pollOnce(slug);
+      await sleep(1000);
+    }
+  }
+}
+
+async function pollOnce(slug: string) {
+  try {
+    await onFresh(await get<Fresh>(`/v1/tenants/${slug}/freshness`, subject()));
+  } catch {
+    lastFresh = null;
+    renderFresh(null);
+  }
+}
+
+async function onFresh(f: Fresh) {
+  if (f.tenant !== state.slug) return; // from the store the user just switched away from
+  skew = Date.parse(f.server_time) - Date.now();
+  lastFresh = f;
+  renderFresh(f);
+  if (f.data_version !== state.version || state.sawStale) {
+    const first = state.version === '';
+    state.version = f.data_version;
+    if (!first || state.sawStale) {
+      await refresh();
+      if (state.pending) {
+        const took = (performance.now() - state.pending.t0) / 1000;
+        toast(`${state.pending.label} is on the dashboard ${took.toFixed(2)} s after commit`, 'good', 9000);
+        state.pending = null;
+      }
+    }
   }
 }
 
@@ -543,24 +586,33 @@ function renderFresh(f: Fresh | null) {
   const dot = el('span', 'chip-dot');
   let label = 'Connecting…', color = '--ink-muted';
   if (f?.status === 'live') dot.classList.add('live');
+  let tip = 'Connecting to the store’s change feed';
   if (f) {
-    const age = f.data_as_of ? Date.now() + skew - Date.parse(f.data_as_of) : null;
+    const since = (t: string | null) => (t ? Date.now() + skew - Date.parse(t) : null);
+    const age = since(f.data_as_of);
+    const change = since(f.last_source_commit_at);
+    tip = `Last change in this store: ${change == null ? 'none since the pipeline started' : ago(change)}.`;
     switch (f.status) {
       case 'live':
-        color = '--good'; label = `Live · updated ${ago(age)}`;
+        // Live = the pipeline is confirming continuously that nothing newer
+        // exists; new data is pushed the moment it lands.
+        color = '--good'; label = change == null ? 'Live · up to date' : `Live · last change ${ago(change)}`;
+        tip += ' Up to date: the change feed confirms every second that nothing newer exists, and new data is pushed here as soon as it lands.';
         break;
       case 'lagging':
-        color = '--warning'; label = `Lagging · ${ago(age)}`;
+        color = '--warning'; label = `Lagging · data ${ago(age)}`;
+        tip += ' The pipeline is behind: the numbers shown are current as of that time.';
         break;
       case 'stalled':
         color = '--critical'; label = 'Pipeline stalled';
+        tip += ' The change feed has not confirmed for over 30 s; the numbers shown may be out of date.';
         break;
       default:
         label = f.status === 'snapshotting' ? 'Loading snapshot…' : 'Provisioning…';
     }
   }
   dot.style.background = `var(${color})`;
-  host.title = 'How recent the newest store data shown here is';
+  host.title = tip;
   host.replaceChildren(dot, el('span', 'tabnum', label));
 }
 

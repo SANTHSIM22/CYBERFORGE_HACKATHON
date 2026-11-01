@@ -96,7 +96,7 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
   <div class="mt-3 mb-5 flex flex-wrap items-center gap-2 text-[11.5px]">
     <span id="lat-summary" class="chip"></span>
     <span class="muted inline-flex items-center gap-1.5"><Icon name="calendar" size={13} /><span id="period"></span></span>
-    <Info align="left" text="Every widget shows how it was answered. Served from cache = repeat view of unchanged data (well under a millisecond). Computed in ClickHouse = first view after new data arrived. From cache · refreshing = the previous answer (at most 5 s old) while the new one is computed; the widget updates a second later. The dashboard never queries the store database." />
+    <Info align="left" text="Every widget shows how it was answered. Served from cache = repeat view of unchanged data (well under a millisecond). Computed in memory = first view after new data arrived, added up from the API's in-memory copy of the rollups (updated with one small read per change). Computed in ClickHouse = a range the in-memory copy cannot answer exactly, such as exact times. From cache · refreshing = the previous answer (at most 5 s old) while the new one is computed; the widget updates a second later. The dashboard never queries the store database." />
   </div>
 
   <section class="grid gap-4 lg:grid-cols-3">

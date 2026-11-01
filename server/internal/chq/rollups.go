@@ -54,26 +54,65 @@ func (q *qb) arg(typ, val string) string {
 
 const tenantWhere = "tenant_id = {t:UUID} AND generation = {g:UInt32}"
 
-// orderParts returns UNION ALL branches yielding (b, currency, status, n, g, r)
-// for one plan; bucket(tier) gives the bucket/period expression per tier.
-func orderParts(q *qb, plan domain.Plan, bucket func(tier string) string, curFilter string) []string {
+// dayPred renders "(col in any of the day ranges)", or "" for none.
+func (q *qb) dayPred(col string, rs []domain.DayRange) string {
+	parts := make([]string, len(rs))
+	for i, d := range rs {
+		parts[i] = fmt.Sprintf("(%s >= %s AND %s < %s)", col, q.arg("Date", d.From), col, q.arg("Date", d.To))
+	}
+	return anyOf(parts)
+}
+
+// timePred renders "(col in any of the time ranges)", or "" for none.
+func (q *qb) timePred(col, typ string, rs []domain.TimeRange, lit func(time.Time) string) string {
+	parts := make([]string, len(rs))
+	for i, r := range rs {
+		parts[i] = fmt.Sprintf("(%s >= %s AND %s < %s)", col, q.arg(typ, lit(r.From)), col, q.arg(typ, lit(r.To)))
+	}
+	return anyOf(parts)
+}
+
+func hourLit(t time.Time) string { return t.UTC().Format(time.DateTime) }
+
+// anyOf ORs the non-empty conditions; "" when there are none.
+func anyOf(conds []string) string {
+	var out []string
+	for _, c := range conds {
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return "(" + strings.Join(out, " OR ") + ")"
+}
+
+// orderParts returns UNION ALL branches yielding (b, currency, status, n, g, r):
+// one per tier (day rollup, hour rollup, raw orders) covering the ranges of
+// every plan. A FINAL read costs ~10 ms however few rows it reads, so a tier's
+// ranges are OR-ed into one read rather than one read per range (an exact-time
+// summary used to be 14 reads). bucket(tier, in) gives the bucket expression
+// per tier; in[i] is plan i's condition on that tier ("" if it has none there).
+func orderParts(q *qb, plans []domain.Plan, bucket func(tier string, in []string) string, curFilter string) []string {
+	days, hours, raw := make([]string, len(plans)), make([]string, len(plans)), make([]string, len(plans))
+	for i, pl := range plans {
+		days[i] = q.dayPred("day", pl.Days)
+		hours[i] = q.timePred("hour", "DateTime('UTC')", pl.Hours, hourLit)
+		raw[i] = q.timePred("created_at", "DateTime64(6, 'UTC')", pl.Raw, ch.Time)
+	}
 	var parts []string
-	for _, d := range plan.Days {
-		parts = append(parts, fmt.Sprintf(`SELECT %s AS b, currency, status, orders AS n, gross AS g, recognized AS r
-			FROM tp.order_day_rollup FINAL WHERE %s AND day >= %s AND day < %s%s`,
-			bucket("day"), tenantWhere, q.arg("Date", d.From), q.arg("Date", d.To), curFilter))
+	add := func(tier string, in []string, cols, from string) {
+		if w := anyOf(in); w != "" {
+			parts = append(parts, fmt.Sprintf("SELECT %s AS b, %s\n\t\t\tFROM %s AND %s%s", bucket(tier, in), cols, from, w, curFilter))
+		}
 	}
-	for _, h := range plan.Hours {
-		parts = append(parts, fmt.Sprintf(`SELECT %s AS b, currency, status, orders AS n, gross AS g, recognized AS r
-			FROM tp.order_hour_rollup FINAL WHERE %s AND hour >= %s AND hour < %s%s`,
-			bucket("hour"), tenantWhere, q.arg("DateTime('UTC')", h.From.UTC().Format(time.DateTime)), q.arg("DateTime('UTC')", h.To.UTC().Format(time.DateTime)), curFilter))
-	}
-	for _, r := range plan.Raw {
-		parts = append(parts, fmt.Sprintf(`SELECT %s AS b, currency, status, toUInt64(1) AS n, toDecimal128(total_amount, 4) AS g,
-			if(status IN %s, toDecimal128(total_amount, 4), toDecimal128(0, 4)) AS r
-			FROM tp.orders FINAL WHERE %s AND created_at >= %s AND created_at < %s AND is_deleted = 0%s`,
-			bucket("raw"), recognizedSQL, tenantWhere, q.arg("DateTime64(6, 'UTC')", ch.Time(r.From)), q.arg("DateTime64(6, 'UTC')", ch.Time(r.To)), curFilter))
-	}
+	rollupCols := "currency, status, orders AS n, gross AS g, recognized AS r"
+	add("day", days, rollupCols, "tp.order_day_rollup FINAL WHERE "+tenantWhere)
+	add("hour", hours, rollupCols, "tp.order_hour_rollup FINAL WHERE "+tenantWhere)
+	add("raw", raw, `currency, status, toUInt64(1) AS n, toDecimal128(total_amount, 4) AS g,
+			if(status IN `+recognizedSQL+`, toDecimal128(total_amount, 4), toDecimal128(0, 4)) AS r`,
+		"tp.orders FINAL WHERE "+tenantWhere+" AND is_deleted = 0")
 	return parts
 }
 
@@ -103,7 +142,7 @@ func StatusRows(ctx context.Context, conn driver.Conn, p Params) ([]StatusRow, e
 	plan := domain.Decompose(p.From, p.To, location(p.TZ), true)
 	rows, err := conn.Query(p.qctx(ctx, q), `
 		SELECT currency, status, sum(n), toString(sum(g)), toString(sum(r))
-		FROM (`+union(orderParts(q, plan, func(string) string { return "''" }, cur))+`)
+		FROM (`+union(orderParts(q, []domain.Plan{plan}, func(string, []string) string { return "''" }, cur))+`)
 		GROUP BY currency, status HAVING sum(n) > 0 ORDER BY currency, status`)
 	if err != nil {
 		return nil, err
@@ -130,8 +169,15 @@ func Summary(ctx context.Context, conn driver.Conn, p Params) (cur, prev []Curre
 	q := newQB(p)
 	loc := location(p.TZ)
 	prevFrom := p.From.Add(-p.To.Sub(p.From))
-	parts := orderParts(q, domain.Decompose(p.From, p.To, loc, true), func(string) string { return "'c'" }, "")
-	parts = append(parts, orderParts(q, domain.Decompose(prevFrom, p.From, loc, true), func(string) string { return "'p'" }, "")...)
+	// Both periods share one read per tier; a row belongs to the current period
+	// exactly when it matches the current plan's ranges (the periods never overlap).
+	plans := []domain.Plan{domain.Decompose(p.From, p.To, loc, true), domain.Decompose(prevFrom, p.From, loc, true)}
+	parts := orderParts(q, plans, func(_ string, in []string) string {
+		if in[0] == "" {
+			return "'p'"
+		}
+		return "if(" + in[0] + ", 'c', 'p')"
+	}, "")
 	rows, err := conn.Query(p.qctx(ctx, q), `
 		SELECT currency,
 		       sumIf(n, b = 'c'), toString(sumIf(g, b = 'c')), toString(sumIf(r, b = 'c')),
@@ -165,10 +211,10 @@ func Trend(ctx context.Context, conn driver.Conn, p Params) ([]TrendPoint, error
 	q := newQB(p)
 	loc := location(p.TZ)
 	var plan domain.Plan
-	var bucket func(string) string
+	var bucket func(string, []string) string
 	if p.Grain == "hour" {
 		plan = domain.Decompose(p.From, p.To, loc, false)
-		bucket = func(tier string) string {
+		bucket = func(tier string, _ []string) string {
 			if tier == "hour" {
 				return "formatDateTime(hour, '%Y-%m-%dT%H:%i:%SZ', 'UTC')"
 			}
@@ -177,7 +223,7 @@ func Trend(ctx context.Context, conn driver.Conn, p Params) ([]TrendPoint, error
 	} else {
 		plan = domain.Decompose(p.From, p.To, loc, true)
 		tz := q.arg("String", p.TZ)
-		bucket = func(tier string) string {
+		bucket = func(tier string, _ []string) string {
 			switch tier {
 			case "day":
 				return "toString(day)"
@@ -190,7 +236,7 @@ func Trend(ctx context.Context, conn driver.Conn, p Params) ([]TrendPoint, error
 	c := q.arg("String", p.Currency)
 	rows, err := conn.Query(p.qctx(ctx, q), `
 		SELECT b, sum(n), toString(sumIf(g, currency = `+c+`)), toString(sumIf(r, currency = `+c+`))
-		FROM (`+union(orderParts(q, plan, bucket, ""))+`)
+		FROM (`+union(orderParts(q, []domain.Plan{plan}, bucket, ""))+`)
 		GROUP BY b HAVING sum(n) > 0 ORDER BY b`)
 	if err != nil {
 		return nil, err
@@ -251,25 +297,50 @@ func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct,
 	plan := domain.Decompose(p.From, p.To, location(p.TZ), true)
 	c := q.arg("String", p.Currency)
 	var parts []string
+	// Whole calendar months from the month cells, the rest from day cells: one
+	// read per table, however many segments.
+	var dayRs, monthRs []domain.DayRange
 	for _, d := range plan.Days {
-		for _, seg := range splitMonths(d) { // whole calendar months from the month cells, the rest from day cells
-			table, col := "tp.product_day_rollup", "day"
+		for _, seg := range splitMonths(d) {
 			if seg.months {
-				table, col = "tp.product_month_rollup", "month"
+				monthRs = append(monthRs, seg.DayRange)
+			} else {
+				dayRs = append(dayRs, seg.DayRange)
 			}
-			parts = append(parts, fmt.Sprintf(`SELECT product_id, quantity AS qty, revenue AS rv FROM %s FINAL
-				WHERE %s AND currency = %s AND %s >= %s AND %s < %s`, table, tenantWhere, c, col, q.arg("Date", seg.From), col, q.arg("Date", seg.To)))
 		}
 	}
+	if w := q.dayPred("day", dayRs); w != "" {
+		parts = append(parts, `SELECT product_id, quantity AS qty, revenue AS rv FROM tp.product_day_rollup FINAL
+			WHERE `+tenantWhere+` AND currency = `+c+` AND `+w)
+	}
+	if w := q.dayPred("month", monthRs); w != "" {
+		parts = append(parts, `SELECT product_id, quantity AS qty, revenue AS rv FROM tp.product_month_rollup FINAL
+			WHERE `+tenantWhere+` AND currency = `+c+` AND `+w)
+	}
+	// Partial days (whole hours and partial-hour edges) from raw lines of the
+	// recognized orders created there, in one read for all edges. Lines are
+	// deduplicated by their newest version (argMax) instead of FINAL: FINAL
+	// widens the read to whole key ranges and undoes the order_id bloom-filter
+	// skipping, and lines can only be bounded below (never older than their
+	// order), so each edge used to re-read every line from its start until now.
+	// Every version of a line shares its order_id and created_at.
 	edges := append(append([]domain.TimeRange{}, plan.Hours...), plan.Raw...)
-	for _, r := range edges {
-		from, to := q.arg("DateTime64(6, 'UTC')", ch.Time(r.From)), q.arg("DateTime64(6, 'UTC')", ch.Time(r.To))
-		parts = append(parts, fmt.Sprintf(`SELECT product_id, toDecimal128(quantity, 6) AS qty, toDecimal128(quantity * unit_price, 12) AS rv
-			FROM tp.order_items FINAL
-			WHERE %s AND created_at >= %s AND is_deleted = 0
-			  AND order_id IN (SELECT order_id FROM tp.orders FINAL WHERE %s AND created_at >= %s AND created_at < %s
-			                   AND is_deleted = 0 AND currency = %s AND status IN %s)`,
-			tenantWhere, from, tenantWhere, from, to, c, recognizedSQL))
+	if w := q.timePred("created_at", "DateTime64(6, 'UTC')", edges, ch.Time); w != "" {
+		first := edges[0].From
+		for _, r := range edges {
+			if r.From.Before(first) {
+				first = r.From
+			}
+		}
+		parts = append(parts, `SELECT pid AS product_id, toDecimal128(qn, 6) AS qty, toDecimal128(qn * price, 12) AS rv FROM (
+			SELECT item_id, argMax(product_id, _version) AS pid, argMax(quantity, _version) AS qn,
+			       argMax(unit_price, _version) AS price, argMax(is_deleted, _version) AS deleted
+			FROM tp.order_items
+			WHERE `+tenantWhere+` AND created_at >= `+q.arg("DateTime64(6, 'UTC')", ch.Time(first))+`
+			  AND order_id IN (SELECT order_id FROM tp.orders FINAL WHERE `+tenantWhere+` AND `+w+`
+			                   AND is_deleted = 0 AND currency = `+c+` AND status IN `+recognizedSQL+`)
+			GROUP BY item_id
+		) WHERE deleted = 0`)
 	}
 	if len(parts) == 0 {
 		return []TopProduct{}, nil

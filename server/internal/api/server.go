@@ -47,6 +47,9 @@ type Server struct {
 	Limiter      *Limiter
 	Win          *Window
 	QueryTimeout time.Duration
+	// StreamKeepalive: an idle freshness stream writes a keepalive comment this
+	// often (under the 30 s after which nginx closes a silent response).
+	StreamKeepalive time.Duration
 
 	sf singleflight.Group
 }
@@ -74,6 +77,7 @@ func (s *Server) Router() *gin.Engine {
 	t := authed.Group("/tenants/:tenant", s.authorizeTenant)
 	t.GET("", s.tenantInfo)
 	t.GET("/freshness", s.freshness)
+	t.GET("/stream", s.stream) // freshness pushed as Server-Sent Events
 	t.GET("/orders/summary", s.ready4(s.summary))
 	t.GET("/orders/count", s.ready4(s.summary)) // PRD example alias
 	t.GET("/orders/trends", s.ready4(s.trends))
@@ -216,7 +220,7 @@ func (s *Server) serve(c *gin.Context, route string, norm normalized, compute fu
 			return
 		}
 		body, _ := json.Marshal(v)
-		s.respond(c, t, route, body, "DIRECT", 0, start)
+		s.respond(c, t, route, answer{body, "direct"}, "DIRECT", 0, start)
 		return
 	}
 	b, _ := json.Marshal(norm)
@@ -229,51 +233,53 @@ func (s *Server) serve(c *gin.Context, route string, norm normalized, compute fu
 	minVersion, _ := strconv.ParseUint(c.Query("min_version"), 10, 64)
 
 	bypass := id.Operator && c.GetHeader("X-TP-Cache") == "bypass"
-	run := func(ctx context.Context) ([]byte, error) { // caller holds a limiter slot
+	run := func(ctx context.Context) (answer, error) { // caller holds a limiter slot
 		qStart := time.Now()
+		ctx, src := withSource(ctx)
 		v, err := compute(ctx)
 		promQueryDur.WithLabelValues(route).Observe(time.Since(qStart).Seconds())
 		if err != nil {
-			return nil, err
+			return answer{}, err
 		}
 		body, err := json.Marshal(v)
+		a := answer{body, *src}
 		if err == nil && !bypass {
-			s.Cache.Put(key, version, body)
+			s.Cache.Put(key, version, a)
 		}
-		return body, err
+		return a, err
 	}
-	fill := func(ctx context.Context) ([]byte, error) {
+	fill := func(ctx context.Context) (answer, error) {
 		release, ok := s.Limiter.Acquire(ctx, t.ID)
 		if !ok {
-			return nil, errBusy
+			return answer{}, errBusy
 		}
 		defer release()
 		return run(ctx)
 	}
 	if !bypass {
-		if body, at, fresh, ok := s.Cache.Get(key, version, minVersion); ok {
+		if a, at, fresh, ok := s.Cache.Get(key, version, minVersion); ok {
 			if fresh {
-				s.respond(c, t, route, body, "HIT", at, start)
+				s.respond(c, t, route, a, "HIT", at, start)
 				return
 			}
-			s.respond(c, t, route, body, "STALE", at, start)
+			s.respond(c, t, route, a, "STALE", at, start)
 			s.revalidate(t.ID, flight, run)
 			return
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c), s.QueryTimeout+time.Second)
 	defer cancel()
-	var body []byte
+	var a answer
 	var err error
 	status := "MISS"
 	if bypass {
 		status = "BYPASS"
-		body, err = fill(WithoutView(ctx)) // an explicit cold ClickHouse measurement: no view, no coalescing, no caching
+		a, err = fill(WithoutView(ctx)) // an explicit cold ClickHouse measurement: no view, no coalescing, no caching
 	} else {
 		var v any
 		v, err, _ = s.sf.Do(flight, func() (any, error) { return fill(ctx) })
 		if err == nil {
-			body = v.([]byte)
+			a = v.(answer)
 		}
 	}
 	switch {
@@ -284,14 +290,14 @@ func (s *Server) serve(c *gin.Context, route string, norm normalized, compute fu
 		slog.Error("query failed", "tenant", t.Slug, "route", route, "err", err)
 		abort(c, 500, "query_failed", "analytics query failed")
 	default:
-		s.respond(c, t, route, body, status, version, start)
+		s.respond(c, t, route, a, status, version, start)
 	}
 }
 
 // revalidate recomputes a stale entry off the request path (the reader already
 // has its answer). Background refreshes queue for at most half of the
 // limiter's slots, so they never crowd out a reader who is waiting.
-func (s *Server) revalidate(tenantID, flight string, run func(context.Context) ([]byte, error)) {
+func (s *Server) revalidate(tenantID, flight string, run func(context.Context) (answer, error)) {
 	done, running := s.Cache.Refreshing(flight)
 	if running {
 		return
@@ -309,20 +315,24 @@ func (s *Server) revalidate(tenantID, flight string, run func(context.Context) (
 	}()
 }
 
-func (s *Server) respond(c *gin.Context, t *registry.Tenant, route string, data []byte, cache string, version uint64, start time.Time) {
+// respond writes the envelope. meta.cache says whether the answer was cached
+// (HIT, STALE), computed now (MISS) or deliberately uncached (BYPASS, DIRECT);
+// meta.source says what computed it: the in-memory view, ClickHouse, or the
+// store database (direct benchmark backend).
+func (s *Server) respond(c *gin.Context, t *registry.Tenant, route string, a answer, cache string, version uint64, start time.Time) {
 	took := float64(time.Since(start).Microseconds()) / 1000
 	c.Header("X-Cache", cache)
 	c.Header("Server-Timing", fmt.Sprintf(`app;dur=%.2f, cache;desc="%s"`, took, cache))
 	c.Header("Cache-Control", "no-store")
-	body := make([]byte, 0, len(data)+256)
+	body := make([]byte, 0, len(a.body)+256)
 	body = append(body, `{"tenant":`...)
 	body = strconv.AppendQuote(body, t.Slug)
 	body = append(body, `,"data":`...)
-	body = append(body, data...)
-	body = fmt.Appendf(body, `,"meta":{"took_ms":%.3f,"cache":"%s","generation":%d,"data_version":"%d","server_time":"%s"}}`,
-		took, cache, t.ActiveGeneration, version, time.Now().UTC().Format(time.RFC3339Nano))
+	body = append(body, a.body...)
+	body = fmt.Appendf(body, `,"meta":{"took_ms":%.3f,"cache":"%s","source":"%s","generation":%d,"data_version":"%d","server_time":"%s"}}`,
+		took, cache, a.source, t.ActiveGeneration, version, time.Now().UTC().Format(time.RFC3339Nano))
 	c.Data(200, "application/json", body)
-	s.Win.Observe(time.Now(), took, cache)
+	s.Win.Observe(time.Now(), took, cache, a.source)
 	promReqDur.WithLabelValues(route, cache).Observe(took / 1000)
 }
 
@@ -547,8 +557,8 @@ func (s *Server) freshness(c *gin.Context) {
 			"data_version": strconv.FormatInt(now.Unix(), 10), "server_time": now, "backend": s.B.Name()})
 		return
 	}
-	// From the 250 ms status poll: every open dashboard polls this each second,
-	// so it must not cost a ClickHouse query per call.
+	// From the 250 ms status poll: a dashboard that cannot stream polls this
+	// each second, so it must not cost a ClickHouse query per call.
 	st, ok := s.Cache.Status(t.ID, t.ActiveGeneration)
 	if !ok { // not polled yet (API just started, or a brand-new generation)
 		var err error
@@ -557,6 +567,15 @@ func (s *Server) freshness(c *gin.Context) {
 			return
 		}
 	}
+	body, _ := s.freshnessBody(t, st, start)
+	c.Header("Cache-Control", "no-store")
+	c.JSON(200, body)
+}
+
+// freshnessBody is the /freshness answer, and each event of /stream. state
+// covers everything a dashboard acts on (data version, status, generation):
+// a stream sends an event only when it changes.
+func (s *Server) freshnessBody(t *registry.Tenant, st chq.Status, start time.Time) (gin.H, string) {
 	now := time.Now()
 	age := func(p *time.Time) *int64 {
 		if p == nil {
@@ -566,31 +585,21 @@ func (s *Server) freshness(c *gin.Context) {
 		return &v
 	}
 	asOf := st.DataAsOf()
-	checkAge := age(st.StreamCheckedAt)
-	if a := age(st.LastHeartbeatSourceAt); a != nil && (checkAge == nil || *a < *checkAge) {
-		checkAge = a
+	status := pipelineHealth(st, now)
+	switch t.Status {
+	case "provisioning", "snapshotting":
+		status = t.Status
 	}
-	status := "live"
-	switch {
-	case t.Status == "provisioning":
-		status = "provisioning"
-	case t.Status == "snapshotting" || !st.Found || st.SnapshotState != "completed":
-		status = "snapshotting"
-	case checkAge == nil || *checkAge > 30_000:
-		status = "stalled"
-	case age(asOf) != nil && *age(asOf) > 30_000:
-		status = "lagging"
-	}
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{
+	version := strconv.FormatUint(s.Cache.Version(t.ID, t.ActiveGeneration), 10)
+	return gin.H{
 		"tenant": t.Slug, "generation": t.ActiveGeneration, "status": status, "tenant_status": t.Status,
 		"snapshot_state": st.SnapshotState, "data_as_of": asOf, "data_age_ms": age(asOf),
 		"last_source_commit_at": st.LastSourceCommitAt, "last_applied_at": st.LastAppliedAt, "processing_lag_ms": st.LastApplyLagMs,
 		"last_heartbeat_source_at": st.LastHeartbeatSourceAt, "stream_checked_at": st.StreamCheckedAt,
 		"slot_lag_bytes": st.SlotLagBytes, "events_applied_total": st.EventsTotal,
-		"data_version": strconv.FormatUint(s.Cache.Version(t.ID, t.ActiveGeneration), 10),
+		"data_version": version,
 		"server_time":  now.UTC(), "took_ms": float64(time.Since(start).Microseconds()) / 1000,
-	})
+	}, fmt.Sprintf("%d|%s|%s|%s", t.ActiveGeneration, status, st.SnapshotState, version)
 }
 
 func nilIfEmpty(s string) *string {

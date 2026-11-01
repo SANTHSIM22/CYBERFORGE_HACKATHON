@@ -72,7 +72,9 @@ flowchart LR
    query computes the new one (stale-while-revalidate). Without this, the
    ingester's flush makes every entry of every tenant invalid at once, and the
    resulting burst of ClickHouse queries was the p95/p99 tail under load. The
-   dashboard sends `min_version` (the version its freshness badge shows), so it
+   dashboard learns new versions from a freshness stream (`/stream`, Server-Sent
+   Events pushed only when its store's version or pipeline health changes), not
+   by polling, and sends `min_version` (the version its freshness badge shows), so it
    never displays data older than the badge; its auto-refresh after new data
    always waits for the new answer (singleflight: one query per widget shared
    by all viewers). Background refreshes queue for at most half of the

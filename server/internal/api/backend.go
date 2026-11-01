@@ -29,6 +29,21 @@ type Backend interface {
 	Currencies(ctx context.Context, t *registry.Tenant) ([]string, error)
 }
 
+// sourceKey carries a *string through a read's context; the backend that
+// answers records itself there ("view", "clickhouse" or "direct").
+type sourceKey struct{}
+
+func withSource(ctx context.Context) (context.Context, *string) {
+	src := new(string)
+	return context.WithValue(ctx, sourceKey{}, src), src
+}
+
+func setSource(ctx context.Context, source string) {
+	if src, ok := ctx.Value(sourceKey{}).(*string); ok {
+		*src = source
+	}
+}
+
 // ---------------------------------------------------------------- ClickHouse
 
 type ClickHouseBackend struct{ CH driver.Conn }
@@ -36,15 +51,19 @@ type ClickHouseBackend struct{ CH driver.Conn }
 func (b ClickHouseBackend) Name() string                   { return "clickhouse" }
 func (b ClickHouseBackend) Ping(ctx context.Context) error { return b.CH.Ping(ctx) }
 func (b ClickHouseBackend) Summary(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.CurrencyTotals, []chq.CurrencyTotals, error) {
+	setSource(ctx, "clickhouse")
 	return chq.Summary(ctx, b.CH, p)
 }
 func (b ClickHouseBackend) StatusRows(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.StatusRow, error) {
+	setSource(ctx, "clickhouse")
 	return chq.StatusRows(ctx, b.CH, p)
 }
 func (b ClickHouseBackend) Trend(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.TrendPoint, error) {
+	setSource(ctx, "clickhouse")
 	return chq.Trend(ctx, b.CH, p)
 }
 func (b ClickHouseBackend) Top(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.TopProduct, error) {
+	setSource(ctx, "clickhouse")
 	return chq.TopProducts(ctx, b.CH, p)
 }
 func (b ClickHouseBackend) Currencies(ctx context.Context, t *registry.Tenant) ([]string, error) {
@@ -166,6 +185,7 @@ func (b *ViewBackend) Prewarm(ctx context.Context, tenants []*registry.Tenant, p
 func (b *ViewBackend) Summary(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.CurrencyTotals, []chq.CurrencyTotals, error) {
 	if v := b.view(ctx, t); v != nil {
 		if cur, prev, ok := v.Summary(p); ok {
+			setSource(ctx, "view")
 			return cur, prev, nil
 		}
 	}
@@ -175,6 +195,7 @@ func (b *ViewBackend) Summary(ctx context.Context, t *registry.Tenant, p chq.Par
 func (b *ViewBackend) StatusRows(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.StatusRow, error) {
 	if v := b.view(ctx, t); v != nil {
 		if rows, ok := v.StatusRows(p); ok {
+			setSource(ctx, "view")
 			return rows, nil
 		}
 	}
@@ -184,6 +205,7 @@ func (b *ViewBackend) StatusRows(ctx context.Context, t *registry.Tenant, p chq.
 func (b *ViewBackend) Trend(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TrendPoint, error) {
 	if v := b.view(ctx, t); v != nil {
 		if pts, ok := v.Trend(p); ok {
+			setSource(ctx, "view")
 			return pts, nil
 		}
 	}
@@ -193,6 +215,7 @@ func (b *ViewBackend) Trend(ctx context.Context, t *registry.Tenant, p chq.Param
 func (b *ViewBackend) Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, error) {
 	if v := b.view(ctx, t); v != nil {
 		if top, ok := v.TopProducts(p); ok {
+			setSource(ctx, "view")
 			return top, nil
 		}
 	}

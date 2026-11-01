@@ -82,10 +82,11 @@ func run(ctx context.Context) error {
 	}
 	srv := &api.Server{
 		B: backend, Direct: direct, Mon: chMon, Reg: reg, Cache: cache, Signer: signer,
-		DevAuth:      config.String("AUTH_MODE", "dev") == "dev",
-		Limiter:      api.NewLimiter(config.Int("API_DB_CONCURRENCY", 24), config.Int("API_TENANT_CONCURRENCY", 4), config.Duration("API_LIMIT_WAIT", time.Second)),
-		Win:          &api.Window{},
-		QueryTimeout: queryTimeout,
+		DevAuth:         config.String("AUTH_MODE", "dev") == "dev",
+		Limiter:         api.NewLimiter(config.Int("API_DB_CONCURRENCY", 24), config.Int("API_TENANT_CONCURRENCY", 4), config.Duration("API_LIMIT_WAIT", time.Second)),
+		Win:             &api.Window{},
+		QueryTimeout:    queryTimeout,
+		StreamKeepalive: min(max(config.Duration("API_STREAM_KEEPALIVE", 20*time.Second), time.Second), 25*time.Second),
 	}
 	hs := &http.Server{
 		Addr:              config.String("API_ADDR", ":8080"),

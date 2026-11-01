@@ -1,6 +1,7 @@
 package stress
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,8 +18,9 @@ import (
 // The read stress test hammers dashboards while stores take light traffic.
 // The write storm is the other real-world case: every store taking orders,
 // status changes and cancellations at a high rate while people watch their
-// dashboards the way the real page does (load four widgets, poll freshness
-// every second, reload when the data version changes). It measures what each
+// dashboards the way the real page does (load four widgets, follow the store's
+// freshness stream, or poll freshness every second where there is no stream,
+// and reload when the data version changes). It measures what each
 // side feels: store transaction latency and throughput, how long a committed
 // order takes to be shown on a dashboard, ingestion throughput, and dashboard
 // latency, with the dashboards on the aggregation layer and, for contrast, on
@@ -60,7 +62,8 @@ type WritePhase struct {
 	DashRequests  int            `json:"dashboard_requests"`
 	DashRPS       float64        `json:"dashboard_rps"`
 	Dash          Pctl           `json:"dashboard_latency"`
-	FreshPoll     Pctl           `json:"freshness_poll_latency"`
+	FreshPoll     Pctl           `json:"freshness_poll_latency"` // viewers without a stream only
+	Streams       int            `json:"freshness_streams_opened"`
 	DashErrors    map[string]int `json:"dashboard_errors"`
 	CacheHit      float64        `json:"cache_hit_ratio"`
 	Visible       Pctl           `json:"commit_to_dashboard"` // marker order committed -> dashboard can show it
@@ -148,11 +151,13 @@ func RunWrites(ctx context.Context, cfg WriteConfig, progress func(Progress)) (W
 type writeRun struct {
 	cfg       WriteConfig
 	hc        *http.Client
+	sc        *http.Client // freshness streams: same transport, no overall timeout
 	measuring atomic.Bool
 
 	mu       sync.Mutex
 	dash     []float64
 	poll     []float64
+	streams  int
 	errs     map[string]int
 	hits     int
 	lookups  int
@@ -171,7 +176,7 @@ func runWritePhase(ctx context.Context, cfg WriteConfig, pools []OLTPTenant, hc 
 			return WritePhase{}, fmt.Errorf("pause capture: %w", err)
 		}
 	}
-	w := &writeRun{cfg: cfg, hc: hc, errs: map[string]int{}}
+	w := &writeRun{cfg: cfg, hc: hc, sc: &http.Client{Transport: hc.Transport}, errs: map[string]int{}}
 	total := cfg.Warmup + cfg.Duration
 	pctx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
@@ -232,6 +237,7 @@ func runWritePhase(ctx context.Context, cfg WriteConfig, pools []OLTPTenant, hc 
 	if d.viewers {
 		ph.Viewers = cfg.Viewers
 		ph.Dash, ph.FreshPoll, ph.DashRequests = Summarize(w.dash), Summarize(w.poll), len(w.dash)+len(w.poll)
+		ph.Streams = w.streams
 		ph.DashRPS = float64(ph.DashRequests) / elapsed
 		if w.lookups > 0 {
 			ph.CacheHit = float64(w.hits) / float64(w.lookups)
@@ -273,6 +279,7 @@ func (w *writeRun) reset() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.dash, w.poll, w.errs, w.hits, w.lookups, w.visible, w.missed, w.eps, w.dataAge, w.probeTx = nil, nil, map[string]int{}, 0, 0, nil, 0, nil, 0, 0
+	w.streams = 0
 }
 
 // get performs one API read and returns its latency (ms), cache status and HTTP status.
@@ -309,6 +316,8 @@ func (w *writeRun) record(kind string, ms float64, cache string, status int, err
 		w.errs["network"]++
 	case status != 200:
 		w.errs[fmt.Sprintf("http_%d", status)]++
+	case kind == "stream":
+		w.streams++
 	case kind == "poll":
 		w.poll = append(w.poll, ms)
 	default:
@@ -322,34 +331,99 @@ func (w *writeRun) record(kind string, ms float64, cache string, status int, err
 	}
 }
 
-// viewer behaves like the dashboard page: load the four widgets, poll
-// freshness every second, reload (asking for at least the new version) when
-// the store's data changes, and switch store or range every 20-40 s.
+// viewer behaves like the dashboard page: load the four widgets, follow the
+// store's freshness stream (or poll freshness every second where there is no
+// stream, as on the direct-primary instance), reload (asking for at least the
+// new version) when the store's data changes, and switch store or range every
+// 20-40 s.
 func (w *writeRun) viewer(ctx context.Context, base string, seed uint64) {
 	r := rand.New(rand.NewPCG(seed+101, uint64(time.Now().UnixNano())))
-	pick := func() (Tenant, string) {
-		return w.cfg.Tenants[r.IntN(len(w.cfg.Tenants))], ranges[r.IntN(len(ranges))]
-	}
-	t, rng := pick()
-	load := func(minV string) {
-		for _, ep := range endpoints {
-			u := base + "/v1/tenants/" + t.Slug + "/" + ep + "?range=" + rng
-			if minV != "" {
-				u += "&min_version=" + minV
-			}
-			ms, cache, status, err := w.get(ctx, u, w.cfg.Tokens[t.Slug], nil)
-			if ctx.Err() != nil {
-				return
-			}
-			w.record("widget", ms, cache, status, err)
-		}
-	}
 	if !sleepCtx(ctx, time.Duration(r.IntN(1000))*time.Millisecond) { // spread viewers over the first second
 		return
 	}
-	load("")
-	version := ""
-	switchAt := time.Now().Add(time.Duration(20+r.IntN(20)) * time.Second)
+	for ctx.Err() == nil {
+		t, rng := w.cfg.Tenants[r.IntN(len(w.cfg.Tenants))], ranges[r.IntN(len(ranges))]
+		load := func(minV string) {
+			for _, ep := range endpoints {
+				u := base + "/v1/tenants/" + t.Slug + "/" + ep + "?range=" + rng
+				if minV != "" {
+					u += "&min_version=" + minV
+				}
+				ms, cache, status, err := w.get(ctx, u, w.cfg.Tokens[t.Slug], nil)
+				if ctx.Err() != nil {
+					return
+				}
+				w.record("widget", ms, cache, status, err)
+			}
+		}
+		load("")
+		vctx, cancel := context.WithTimeout(ctx, time.Duration(20+r.IntN(20))*time.Second)
+		if !w.followStream(vctx, base, t, load) {
+			w.pollFreshness(vctx, base, t, r, load)
+		}
+		cancel()
+	}
+}
+
+// onVersion reloads the widgets when a store's data version changes; the
+// first version seen only records where the widgets already are.
+type onVersion struct {
+	version string
+	load    func(minVersion string)
+}
+
+func (o *onVersion) see(v string) {
+	if v == "" || v == o.version {
+		return
+	}
+	first := o.version == ""
+	o.version = v
+	if !first {
+		o.load(v)
+	}
+}
+
+// followStream reads the store's freshness stream until ctx ends, reloading on
+// each new data version. It returns false if the API offers no stream, so the
+// caller polls instead (the page does the same).
+func (w *writeRun) followStream(ctx context.Context, base string, t Tenant, load func(string)) bool {
+	req, _ := http.NewRequestWithContext(ctx, "GET", base+"/v1/tenants/"+t.Slug+"/stream", nil)
+	req.Header.Set("Authorization", "Bearer "+w.cfg.Tokens[t.Slug])
+	resp, err := w.sc.Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.record("stream", 0, "", 0, err)
+		}
+		return ctx.Err() != nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false
+	}
+	w.record("stream", 0, "", 200, nil)
+	o := onVersion{load: load}
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var f struct {
+			DataVersion string `json:"data_version"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(line[len("data:"):])), &f) == nil {
+			o.see(f.DataVersion)
+		}
+	}
+	if ctx.Err() == nil { // the stream broke before the viewer moved on
+		w.record("stream", 0, "", 0, fmt.Errorf("stream ended: %v", sc.Err()))
+	}
+	return true
+}
+
+// pollFreshness polls freshness about once a second until ctx ends.
+func (w *writeRun) pollFreshness(ctx context.Context, base string, t Tenant, r *rand.Rand, load func(string)) {
+	o := onVersion{load: load}
 	for sleepCtx(ctx, 900*time.Millisecond+time.Duration(r.IntN(200))*time.Millisecond) {
 		var f struct {
 			DataVersion string `json:"data_version"`
@@ -359,19 +433,7 @@ func (w *writeRun) viewer(ctx context.Context, base string, seed uint64) {
 			return
 		}
 		w.record("poll", ms, "", status, err)
-		if f.DataVersion != "" && f.DataVersion != version {
-			first := version == ""
-			version = f.DataVersion
-			if !first {
-				load(version)
-			}
-		}
-		if time.Now().After(switchAt) {
-			t, rng = pick()
-			version = ""
-			load("")
-			switchAt = time.Now().Add(time.Duration(20+r.IntN(20)) * time.Second)
-		}
+		o.see(f.DataVersion)
 	}
 }
 

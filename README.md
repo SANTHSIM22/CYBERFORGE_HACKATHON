@@ -57,7 +57,9 @@ Check status: `docker compose ps` (all services `healthy`), then
    - **Try cross-tenant read** uses this store's token to request another
      store's numbers. The API refuses with HTTP 403.
 4. Every widget states its own speed: *"Answered in 0.1 ms (cache hit) · 3 ms round trip"*.
-5. The badge at the top right shows freshness: *"✓ Live · data as of 1 s ago"*.
+5. The badge at the top right shows freshness: *"Live · last change 4m ago"*.
+   New data is pushed to the page the moment it lands; the badge turns
+   *Lagging* or *Pipeline stalled* if the pipeline falls behind or stops.
 
 ## REST API
 
@@ -77,6 +79,7 @@ curl -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/tenants/tenant-001/ord
 | `GET /v1/tenants/{t}/products/top?range=7d&limit=10&currency=` | FR-3 |
 | `GET /v1/tenants/{t}/orders/breakdown?range=7d` | FR-4 current status of orders created in range |
 | `GET /v1/tenants/{t}/freshness` | B-1 |
+| `GET /v1/tenants/{t}/stream` | B-1 pushed: the same body as Server-Sent Events, sent only when the store's data or pipeline health changes (the dashboard uses this instead of polling) |
 | `GET /v1/tenants/{t}` | timezone, currencies, status |
 | `GET /v1/admin/stats` (operator) | B-5; per-second series for dashboard reads and, separately, cache-bypassed benchmark reads |
 | `GET /metrics` | Prometheus |

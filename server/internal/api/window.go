@@ -23,6 +23,7 @@ type second struct {
 	unix                 int64
 	hits, stale, miss    int
 	all, cached, db, byp hist
+	view, ch             hist // misses split by what computed them (db = both)
 }
 
 // hist is a log-scale latency histogram: bucket i covers
@@ -81,7 +82,9 @@ func (h *hist) summary() Percentiles {
 	return Percentiles{P50: h.quantile(0.50), P95: h.quantile(0.95), P99: h.quantile(0.99), Count: h.n}
 }
 
-func (w *Window) Observe(now time.Time, ms float64, cache string) {
+// Observe records one dashboard read; source ("view" or "clickhouse") splits
+// the misses.
+func (w *Window) Observe(now time.Time, ms float64, cache, source string) {
 	sec := now.Unix()
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -102,6 +105,11 @@ func (w *Window) Observe(now time.Time, ms float64, cache string) {
 	case "MISS":
 		b.miss++
 		b.db.add(ms)
+		if source == "view" {
+			b.view.add(ms)
+		} else {
+			b.ch.add(ms)
+		}
 	}
 	b.all.add(ms)
 }
@@ -118,16 +126,18 @@ type Point struct {
 	RPS      int     `json:"rps"`
 	P95      float64 `json:"p95_ms"`
 	HitRatio float64 `json:"hit_ratio"`
-	ProbeRPS int     `json:"probe_rps"`    // cache-bypassed benchmark reads (ClickHouse only)
+	ProbeRPS int     `json:"probe_rps"` // cache-bypassed benchmark reads (ClickHouse only)
 	ProbeP95 float64 `json:"probe_p95_ms"`
 }
 
 type WindowStats struct {
 	WindowSeconds int         `json:"window_seconds"`
-	All           Percentiles `json:"all"`       // dashboard traffic (cache + ClickHouse)
-	CacheHit      Percentiles `json:"cache_hit"` // answered from cache (current or stale)
-	Database      Percentiles `json:"database"`  // computed in ClickHouse on a miss
-	Probes        Percentiles `json:"probes"`    // benchmark reads that bypass the cache
+	All           Percentiles `json:"all"`        // dashboard traffic (cache + ClickHouse)
+	CacheHit      Percentiles `json:"cache_hit"`  // answered from cache (current or stale)
+	Database      Percentiles `json:"database"`   // computed on a miss: View + ClickHouse
+	View          Percentiles `json:"view"`       // misses answered from the in-memory rollups
+	ClickHouse    Percentiles `json:"clickhouse"` // misses that queried ClickHouse
+	Probes        Percentiles `json:"probes"`     // benchmark reads that bypass the cache
 	Requests      int         `json:"requests"`
 	RPS           float64     `json:"rps"`
 	HitRatio      float64     `json:"hit_ratio"`   // cache-served share (current + stale)
@@ -138,7 +148,7 @@ type WindowStats struct {
 func (w *Window) Stats(now time.Time, window int) WindowStats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var all, cached, db, byp hist
+	var all, cached, db, byp, view, clk hist
 	st := WindowStats{WindowSeconds: window}
 	hits, stale, lookups := 0, 0, 0
 	cur := now.Unix()
@@ -150,6 +160,8 @@ func (w *Window) Stats(now time.Time, window int) WindowStats {
 			cached.merge(&b.cached)
 			db.merge(&b.db)
 			byp.merge(&b.byp)
+			view.merge(&b.view)
+			clk.merge(&b.ch)
 			hits += b.hits + b.stale
 			stale += b.stale
 			lookups += b.hits + b.stale + b.miss
@@ -164,6 +176,7 @@ func (w *Window) Stats(now time.Time, window int) WindowStats {
 		st.Series = append(st.Series, p)
 	}
 	st.All, st.CacheHit, st.Database, st.Probes = all.summary(), cached.summary(), db.summary(), byp.summary()
+	st.View, st.ClickHouse = view.summary(), clk.summary()
 	st.Requests = all.n
 	st.RPS = float64(all.n) / float64(window)
 	if lookups > 0 {

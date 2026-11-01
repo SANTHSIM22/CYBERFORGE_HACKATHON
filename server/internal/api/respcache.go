@@ -32,16 +32,98 @@ type RespCache struct {
 	versions map[string]uint64    // tenantID:generation -> data_version
 	asOf     map[string]time.Time // tenantID:generation -> source state fully reflected up to
 	status   map[string]chq.Status
+
+	umu    sync.Mutex
+	subs   map[string]chan struct{} // tenantID:generation -> closed when that store's data, snapshot state or health changes
+	health map[string]string        // tenantID:generation -> pipeline health at the last poll
+	now    func() time.Time
+}
+
+// pipelineHealth is a store's pipeline state from its status row:
+// "snapshotting" (first copy still loading), "stalled" (the change stream has
+// not confirmed in 30 s), "lagging" (the newest data is over 30 s old) or
+// "live". It depends on the clock, not only on new rows.
+func pipelineHealth(st chq.Status, now time.Time) string {
+	if !st.Found || st.SnapshotState != "completed" {
+		return "snapshotting"
+	}
+	checked := st.StreamCheckedAt
+	if hb := st.LastHeartbeatSourceAt; hb != nil && (checked == nil || hb.After(*checked)) {
+		checked = hb
+	}
+	if checked == nil || now.Sub(*checked) > 30*time.Second {
+		return "stalled"
+	}
+	if at := st.DataAsOf(); at != nil && now.Sub(*at) > 30*time.Second {
+		return "lagging"
+	}
+	return "live"
+}
+
+// answer is a response body and the path that computed it: "view" (the
+// in-memory rollups) or "clickhouse". It is reported as meta.source, also on
+// cache hits.
+type answer struct {
+	body   []byte
+	source string
 }
 
 type cacheEntry struct {
-	body    []byte
+	answer
 	version uint64
 	at      time.Time
 }
 
 func NewRespCache(maxItems int, ttl, stale time.Duration) *RespCache {
-	return &RespCache{entries: map[string]cacheEntry{}, maxItems: maxItems, ttl: ttl, stale: stale, versions: map[string]uint64{}, asOf: map[string]time.Time{}}
+	return &RespCache{entries: map[string]cacheEntry{}, maxItems: maxItems, ttl: ttl, stale: stale, versions: map[string]uint64{}, asOf: map[string]time.Time{},
+		subs: map[string]chan struct{}{}, now: time.Now}
+}
+
+// Changed returns a channel that is closed when a version poll sees the
+// store's data version, snapshot state or pipeline health change, so a
+// freshness stream wakes only when its own store has something to report
+// (waking every stream on every poll cost ~0.5 core at 2,000 streams).
+func (c *RespCache) Changed(tenantID string, gen int64) <-chan struct{} {
+	k := tenantID + ":" + strconv.FormatInt(gen, 10)
+	c.umu.Lock()
+	defer c.umu.Unlock()
+	ch, ok := c.subs[k]
+	if !ok {
+		ch = make(chan struct{})
+		c.subs[k] = ch
+	}
+	return ch
+}
+
+// publish installs one poll's results (status nil: the poll failed, keep the
+// last ones) and wakes the streams of every store whose data version,
+// snapshot state or pipeline health changed. Health is re-evaluated after
+// failed polls too, so a pipeline that stops confirming turns "stalled" even
+// while ClickHouse cannot be reached.
+func (c *RespCache) publish(versions map[string]uint64, asOf map[string]time.Time, status map[string]chq.Status) {
+	now := c.now()
+	c.vmu.Lock()
+	old := c.status
+	if status != nil {
+		c.versions, c.asOf, c.status = versions, asOf, status
+	}
+	cur := c.status
+	c.vmu.Unlock()
+	health := make(map[string]string, len(cur))
+	for k, st := range cur {
+		health[k] = pipelineHealth(st, now)
+	}
+	c.umu.Lock()
+	defer c.umu.Unlock()
+	prev := c.health
+	c.health = health
+	for k, ch := range c.subs {
+		o, n := old[k], cur[k]
+		if o.Found != n.Found || o.DataVersion != n.DataVersion || o.SnapshotState != n.SnapshotState || prev[k] != health[k] {
+			close(ch)
+			delete(c.subs, k)
+		}
+	}
 }
 
 func (c *RespCache) Version(tenantID string, gen int64) uint64 {
@@ -64,20 +146,20 @@ func (c *RespCache) AsOf(tenantID string, gen int64) *time.Time {
 
 // Get returns the entry for key if it is at `version` (fresh), or behind it
 // but at least `minVersion` and computed within the stale window (fresh=false).
-func (c *RespCache) Get(key string, version, minVersion uint64) (body []byte, at uint64, fresh, ok bool) {
+func (c *RespCache) Get(key string, version, minVersion uint64) (a answer, at uint64, fresh, ok bool) {
 	c.mu.Lock()
 	e, found := c.entries[key]
 	c.mu.Unlock()
 	age := time.Since(e.at)
 	switch {
 	case !found || age > c.ttl:
-		return nil, 0, false, false
+		return answer{}, 0, false, false
 	case e.version >= version:
-		return e.body, e.version, true, true
+		return e.answer, e.version, true, true
 	case c.stale > 0 && e.version >= minVersion && age <= c.stale:
-		return e.body, e.version, false, true
+		return e.answer, e.version, false, true
 	}
-	return nil, 0, false, false
+	return answer{}, 0, false, false
 }
 
 // Refreshing reports whether a background refresh for key is already running;
@@ -89,7 +171,7 @@ func (c *RespCache) Refreshing(key string) (done func(), running bool) {
 	return func() { c.inflight.Delete(key) }, false
 }
 
-func (c *RespCache) Put(key string, version uint64, body []byte) {
+func (c *RespCache) Put(key string, version uint64, a answer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.entries) >= c.maxItems { // bounded memory: drop expired, else everything
@@ -106,7 +188,7 @@ func (c *RespCache) Put(key string, version uint64, body []byte) {
 	if e, ok := c.entries[key]; ok && e.version > version {
 		return // a slower, older computation never replaces a newer answer
 	}
-	c.entries[key] = cacheEntry{body, version, time.Now()}
+	c.entries[key] = cacheEntry{a, version, time.Now()}
 }
 
 // Status returns the tenant's freshness row from the last poll, so
@@ -143,11 +225,10 @@ func (c *RespCache) PollVersions(ctx context.Context, mon driver.Conn, every tim
 				}
 			}
 			rows.Close()
-			c.vmu.Lock()
-			c.versions, c.asOf, c.status = next, asOf, status
-			c.vmu.Unlock()
+			c.publish(next, asOf, status)
 		} else if ctx.Err() == nil {
 			slog.Warn("poll data versions", "err", err)
+			c.publish(nil, nil, nil)
 		}
 		select {
 		case <-ctx.Done():

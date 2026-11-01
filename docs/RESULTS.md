@@ -135,6 +135,73 @@ added, so its "top-10 products 365d" figure read daily cells. With monthly
 cells at 1M too, that row's growth ratio would be somewhat higher than 1.33×.
 Every other row ran the same query path at both sizes.
 
+## Read-side changes (2026-11-01, 10M data, 100 stores)
+
+Three changes to the read side, measured on the same 10M data. Nothing in the
+ingester or the ClickHouse schema changed. `tpctl verify` after the query
+change: **6,932 / 6,932 checks exact**.
+
+### 1. ClickHouse fallback: one read per table
+
+Queries the in-memory view cannot answer exactly (exact-time ranges, 365-day
+top products) used to issue one `FINAL` read per time range, about 10 ms each
+however few rows they read: an exact-time summary was 14 reads. Top products
+re-read every order line from each partial-hour edge until now. Now each table
+is read once with its ranges combined, and order lines are de-duplicated with
+`argMax`, as the ingester already does. Largest store, cache and views
+bypassed, median of 7 to 9 calls:
+
+| Query (exact time range, 9 days) | Before | After |
+|---|---:|---:|
+| Top 10 products | 4,762 ms | 103–119 ms |
+| Summary (with previous period) | 167 ms | 68–86 ms |
+| Status breakdown | 70 ms | 52–62 ms |
+| Daily trend | 77 ms | 57–72 ms |
+
+Preset ranges (today to 365 days) run the same SQL as before and stayed within
+run-to-run noise (±20%); the ladder's ClickHouse column is unchanged at p50.
+
+### 2. Freshness pushed instead of polled
+
+Each open dashboard used to poll `/freshness` every second. It now holds one
+stream (`/stream`, Server-Sent Events) and receives an event only when its
+store's data version or pipeline health changes, plus an invisible keepalive
+every 20 s. API CPU over 30 s (`process_cpu_seconds_total`), 2,000 dashboards
+held open by k6, stores idle:
+
+| 2,000 open dashboards | API CPU (one core = 100%) |
+|---|---:|
+| Idle, no dashboards | 2% |
+| Polling `/freshness` every second | 77% |
+| Stream, event every 2 s (first version) | 32% |
+| **Stream, events only on change (shipped)** | **5%** |
+
+ClickHouse CPU did not move in any of these: freshness is answered from the
+API's memory. A pushed order reached an open dashboard 1.7–3.2 s after commit.
+
+### 3. `meta.source` on every answer
+
+Responses now say what computed them (`view` = in-memory rollups,
+`clickhouse` = a query), and Monitor splits miss latency the same way. Before,
+every miss was labelled "computed in ClickHouse", including the ones added up
+in memory in under a millisecond.
+
+### Re-runs after the changes (CPU-pinned)
+
+| Test | Published (10/31) | After (11/01) |
+|---|---|---|
+| Read stress, aggregation layer: req/s, p50 / p95 / p99, hits | 1,297, 8.7 / 40.7 / 84.3 ms, 97% | run 1: 784, 7.0 / 39.7 / 356 ms, 87% · run 2: 3,006, 3.5 / 16.9 / 31.7 ms, 97% |
+| Read stress, ClickHouse only: req/s, p95 | 45, 891 ms | 50, 896–970 ms |
+| Write storm 300 tx/s, aggregation phase: store p95, dashboard p95, ingest/s | 355 ms, 4.79 s, 286 | 263 ms, 2.74 s, 388 |
+| Write storm 1,000 tx/s, aggregation phase: store p95, dashboard p95, ingest/s | 253 ms, 3.72 s, 760 | 584 ms, 3.59 s, 0 (no flush finished in the window) |
+
+The two read-stress runs on the same build differ by almost 4×: on one laptop
+the result depends on what else is running (ClickHouse merges, the previous
+phase's load). The 1,000 tx/s storm is beyond what this laptop's store
+database sustains, as noted above, and varies the same way. Evidence:
+`stress-20261101-025847`, `stress-20261101-032029`, `writestorm-20261101-031610`,
+`writestorm-20261101-031941`, `ladder-tenant-001-20261101-025607`.
+
 ## How it was measured
 
 | | |
@@ -152,7 +219,7 @@ Every other row ran the same query path at both sizes.
 | `freshness` | Inserts 30 orders into the largest store and times until each is queryable in ClickHouse and until the API reports data current past it. |
 | `oltp` | The same fixed store workload (300 operations/s) with change capture paused, then running. |
 | `stress` | 20 simulated users with no pause between requests against (1) an API that queries the store databases directly, (2) the aggregation layer, (3) ClickHouse with cache and views switched off. |
-| `write-storm` | All stores take checkouts, status changes and cancellations at a target rate while 100 viewers use dashboards like the real page (load four widgets, poll freshness every second, reload when the store's data changes). Run at 1,000 transactions/s (beyond what the laptop's store database sustains) and at 300/s for the database-safety comparison. A marker order committed twice a second times "new order visible"; Postgres' transaction counters show how many dashboard queries reached the store databases. |
+| `write-storm` | All stores take checkouts, status changes and cancellations at a target rate while 100 viewers use dashboards like the real page (load four widgets, follow the store's freshness stream, or poll freshness every second on the direct-primary instance, which has no stream; reload when the store's data changes). Run at 1,000 transactions/s (beyond what the laptop's store database sustains) and at 300/s for the database-safety comparison. A marker order committed twice a second times "new order visible"; Postgres' transaction counters show how many dashboard queries reached the store databases. |
 
 ## Evidence
 

@@ -6,7 +6,7 @@ import { demoAvailable } from '../lib/api';
 
 type Pct = { p50: number; p95: number; p99: number; count: number };
 type ApiWindow = {
-  all: Pct; cache_hit: Pct; database: Pct; probes: Pct; rps: number; hit_ratio: number; stale_ratio: number; requests: number;
+  all: Pct; cache_hit: Pct; database: Pct; view?: Pct; clickhouse?: Pct; probes: Pct; rps: number; hit_ratio: number; stale_ratio: number; requests: number;
   series: { t: number; rps: number; p95_ms: number; hit_ratio: number; probe_rps: number; probe_p95_ms: number }[];
 };
 type Stats = {
@@ -129,7 +129,12 @@ async function tick() {
   $('updated').textContent = `Updated ${clock.format(new Date())} · every 2 s`;
 
   tile('p50', a.all.count ? ms(a.all.p50) : '—', a.all.count ? `${int(a.requests)} reads in 60 s` : 'no reads yet — open the dashboard');
-  tile('p95', a.all.count ? ms(a.all.p95) : '—', a.database.count ? `computed in ClickHouse: p95 ${ms(a.database.p95)}` : 'target < 200 ms', a.all.p95 > 200 ? 'bad' : 'good');
+  // Misses split by what computed them: the in-memory rollups or a ClickHouse query.
+  const misses = [
+    a.view?.count ? `in memory p95 ${ms(a.view.p95)}` : '',
+    a.clickhouse?.count ? `ClickHouse p95 ${ms(a.clickhouse.p95)}` : '',
+  ].filter(Boolean).join(' · ');
+  tile('p95', a.all.count ? ms(a.all.p95) : '—', misses ? `computed: ${misses}` : 'target < 200 ms', a.all.p95 > 200 ? 'bad' : 'good');
   tile('p99', a.all.count ? ms(a.all.p99) : '—', a.probes.count
     ? `excludes ${int(a.probes.count)} benchmark reads (cache bypassed, p95 ${ms(a.probes.p95)})`
     : a.cache_hit.count ? `cache hits p99 ${ms(a.cache_hit.p99)}` : '');
