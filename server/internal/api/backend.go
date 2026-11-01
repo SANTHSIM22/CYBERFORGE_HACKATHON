@@ -5,10 +5,13 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"tenantpulse/internal/chq"
 	"tenantpulse/internal/directsql"
@@ -25,7 +28,7 @@ type Backend interface {
 	Summary(ctx context.Context, t *registry.Tenant, p chq.Params) (cur, prev []chq.CurrencyTotals, err error)
 	StatusRows(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.StatusRow, error)
 	Trend(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TrendPoint, error)
-	Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, error)
+	Top(ctx context.Context, t *registry.Tenant, p chq.Params) (page []chq.TopProduct, total int, err error)
 	Currencies(ctx context.Context, t *registry.Tenant) ([]string, error)
 }
 
@@ -62,7 +65,7 @@ func (b ClickHouseBackend) Trend(ctx context.Context, _ *registry.Tenant, p chq.
 	setSource(ctx, "clickhouse")
 	return chq.Trend(ctx, b.CH, p)
 }
-func (b ClickHouseBackend) Top(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.TopProduct, error) {
+func (b ClickHouseBackend) Top(ctx context.Context, _ *registry.Tenant, p chq.Params) ([]chq.TopProduct, int, error) {
 	setSource(ctx, "clickhouse")
 	return chq.TopProducts(ctx, b.CH, p)
 }
@@ -81,9 +84,18 @@ type ViewBackend struct {
 	Version func(tenantID string, gen int64) uint64
 	Timeout time.Duration
 	Wait    time.Duration // longest a reader waits for a view to catch up before ClickHouse answers
-	views   sync.Map      // tenant ID -> *chq.View (active generation)
+	Idle    time.Duration // a view nobody reads for this long is dropped (0 = never)
+	views   sync.Map      // tenant ID -> *viewSlot (active generation)
 	syncs   sync.Map      // *chq.View -> *viewSync in flight
 }
+
+type viewSlot struct {
+	view *chq.View
+	used atomic.Int64 // unix nanoseconds of the last read
+}
+
+var promViews = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "tenantpulse_api_views", Help: "Stores whose rollups this API copy holds in memory."})
 
 type noViewKey struct{}
 
@@ -94,12 +106,61 @@ func WithoutView(ctx context.Context) context.Context {
 }
 
 func (b *ViewBackend) get(t *registry.Tenant) *chq.View {
-	vi, ok := b.views.Load(t.ID)
-	if !ok || vi.(*chq.View).Gen != t.ActiveGeneration { // first use, or a rebuild cut over
-		vi = chq.NewView(t.ID, t.ActiveGeneration, t.Timezone)
-		b.views.Store(t.ID, vi)
+	now := time.Now().UnixNano()
+	si, ok := b.views.Load(t.ID)
+	if !ok || si.(*viewSlot).view.Gen != t.ActiveGeneration { // first use, after eviction, or a rebuild cut over
+		s := &viewSlot{view: chq.NewView(t.ID, t.ActiveGeneration, t.Timezone)}
+		s.used.Store(now)
+		if !ok {
+			if prev, loaded := b.views.LoadOrStore(t.ID, s); loaded { // another reader created it first
+				si = prev
+			} else {
+				promViews.Inc()
+				return s.view
+			}
+		} else {
+			b.views.Store(t.ID, s)
+			return s.view
+		}
 	}
-	return vi.(*chq.View)
+	s := si.(*viewSlot)
+	s.used.Store(now)
+	return s.view
+}
+
+// EvictIdle drops, every `every`, the views of stores nobody has read for
+// Idle, so memory follows the stores people are watching rather than every
+// store this copy has ever served. A dropped view loads again on the next
+// read, which ClickHouse answers in the meantime.
+func (b *ViewBackend) EvictIdle(ctx context.Context, every time.Duration) {
+	if b.Idle <= 0 {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			b.evict(now)
+		}
+	}
+}
+
+func (b *ViewBackend) evict(now time.Time) (kept, dropped int) {
+	cutoff := now.Add(-b.Idle).UnixNano()
+	b.views.Range(func(k, si any) bool {
+		s := si.(*viewSlot)
+		if _, syncing := b.syncs.Load(s.view); s.used.Load() < cutoff && !syncing && b.views.CompareAndDelete(k, si) {
+			dropped++
+		} else {
+			kept++
+		}
+		return true
+	})
+	promViews.Set(float64(kept))
+	return kept, dropped
 }
 
 type viewSync struct {
@@ -212,11 +273,11 @@ func (b *ViewBackend) Trend(ctx context.Context, t *registry.Tenant, p chq.Param
 	return b.ClickHouseBackend.Trend(ctx, t, p)
 }
 
-func (b *ViewBackend) Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, error) {
+func (b *ViewBackend) Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, int, error) {
 	if v := b.view(ctx, t); v != nil {
-		if top, ok := v.TopProducts(p); ok {
+		if top, total, ok := v.TopProducts(p); ok {
 			setSource(ctx, "view")
-			return top, nil
+			return top, total, nil
 		}
 	}
 	return b.ClickHouseBackend.Top(ctx, t, p)
@@ -278,12 +339,12 @@ func (b *DirectBackend) Trend(ctx context.Context, t *registry.Tenant, p chq.Par
 	return directsql.Trend(ctx, pool, p.From, p.To, t.Timezone, p.Grain, p.Currency)
 }
 
-func (b *DirectBackend) Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, error) {
+func (b *DirectBackend) Top(ctx context.Context, t *registry.Tenant, p chq.Params) ([]chq.TopProduct, int, error) {
 	pool, err := b.pool(ctx, t)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return directsql.TopProducts(ctx, pool, p.From, p.To, p.Currency, p.Limit)
+	return directsql.TopProducts(ctx, pool, p.From, p.To, p.Currency, p.Limit, p.Offset)
 }
 
 func (b *DirectBackend) Currencies(ctx context.Context, t *registry.Tenant) ([]string, error) {

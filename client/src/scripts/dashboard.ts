@@ -1,27 +1,43 @@
-import { ApiError, demo, demoAvailable, get, stream, subjects, type Envelope, type Subject } from '../lib/api';
+import { ApiError, demo, demoAvailable, directory, get, stream, type Envelope, type OrgSubject, type Subject } from '../lib/api';
 import { $, ago, compactNum, cssVar, currencySymbol, el, int, money, ms, pct, toast } from '../lib/format';
 import { compactTick, lineChart, sparkline, type ChartHandle } from '../lib/charts';
-import { loadBench, READ_TEST, renderStress, renderWrites, wireStressButtons, WRITE_TEST } from '../lib/bench';
 import { icon } from '../lib/icons';
 
 type Totals = { currency: string; orders: number; gross_sales: string; recognized_sales: string };
-type Summary = { totals: Totals[]; total_orders: number; timezone: string; from: string; to: string; previous: { totals: Totals[]; total_orders: number; from: string; to: string } };
+type OrgStore = { slug: string; name: string; timezone: string; currency: string; orders: number; gross_sales: string; recognized_sales: string };
+type ByCurrency = { currency: string; orders: number; gross_sales: string; gross_sales_converted: string };
+type FX = { reporting_currency: string; rates_as_of: string; units_per_usd: Record<string, string>; missing_rates: string[] };
+type Summary = {
+  totals: Totals[]; total_orders: number; timezone: string; from: string; to: string;
+  previous: { totals: Totals[]; total_orders: number; from: string; to: string };
+  stores?: OrgStore[]; by_currency?: ByCurrency[]; fx?: FX; // org dashboards
+};
 type Point = { bucket: string; orders: number; gross_sales: string; recognized_sales: string };
 type Trends = { points: Point[]; currency: string; grain: 'day' | 'hour'; timezone: string };
 type StatusRow = { status: string; orders: number; recognized: boolean };
 type Breakdown = { statuses: StatusRow[]; total_orders: number };
-type Product = { rank: number; product_id: string; name: string; sku: string | null; quantity: string; revenue: string };
-type Top = { products: Product[]; currency: string };
-type Fresh = { tenant: string; status: string; data_as_of: string | null; last_source_commit_at: string | null; data_version: string; server_time: string; snapshot_state: string };
-type TenantInfo = { slug: string; name: string; tier: string; status: string; timezone: string; default_currency: string; currencies: string[] };
+type Product = { rank: number; product_id: string; name: string; sku: string | null; quantity: string; revenue: string; store_name?: string };
+type Top = { products: Product[]; currency: string; limit: number; offset: number; total: number; next_offset: number | null };
+type Fresh = {
+  scope: string; status: string; data_as_of: string | null; last_source_commit_at: string | null; fresh_within_ms?: number;
+  data_version: string; server_time: string; snapshot_state?: string; stores?: number; stores_behind?: number;
+};
+type TenantInfo = { slug: string; name: string; tier?: string; status: string; timezone?: string; default_currency: string; currencies: string[]; stores?: unknown[]; reporting_currency?: string };
 type Metric = 'orders' | 'gross' | 'recognized';
+type Scope = 'store' | 'org';
 
 const RANGES = ['today', '7d', '30d', '90d', 'custom'];
 const TIER: Record<string, string> = { XL: 'Extra-large store', L: 'Large store', M: 'Medium store', S: 'Small store' };
 
 const state = {
   tenants: [] as Subject[],
+  orgs: [] as OrgSubject[],
+  kind: 'store' as Scope, // what the page shows: one store, or an org across its stores
   slug: '',
+  as: '', // the identity it reads with: tenant:<slug>, or org:<slug> (an org admin, also when opening one of its stores)
+  parentOrg: null as OrgSubject | null, // set while an org admin looks at one of the org's stores
+  topN: 10,
+  topOffset: 0,
   info: null as TenantInfo | null,
   range: '7d',
   from: '',
@@ -41,7 +57,10 @@ const state = {
   firstLoad: true,
 };
 
-const subject = () => 'tenant:' + state.slug;
+const subject = () => state.as;
+const base = () => (state.kind === 'org' ? `/v1/orgs/${state.slug}` : `/v1/tenants/${state.slug}`);
+const scopeKey = () => (state.kind === 'org' ? 'org:' : 'tenant:') + state.slug;
+const viewerTZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 function qs(extra: Record<string, string> = {}): string {
   const p = new URLSearchParams();
@@ -49,6 +68,7 @@ function qs(extra: Record<string, string> = {}): string {
     p.set('from', state.from);
     p.set('to', state.to);
   } else p.set('range', state.range);
+  if (state.kind === 'org') p.set('tz', viewerTZ); // org days follow the viewer's clock
   for (const [k, v] of Object.entries(extra)) if (v) p.set(k, v);
   if (state.version) p.set('min_version', state.version); // never show data older than the freshness badge
   return '?' + p.toString();
@@ -74,28 +94,47 @@ function latency(id: string, env: { meta: Envelope<unknown>['meta']; rttMs: numb
 async function init() {
   wireControls();
   try {
-    state.tenants = await subjects();
+    ({ tenants: state.tenants, orgs: state.orgs } = await directory());
   } catch {
     banner('Cannot reach the API. Start the stack with docker compose up -d, then reload.');
     renderFresh(null);
     return;
   }
+  // Each option is an identity: an org admin (the org's consolidated
+  // dashboard) or a store owner (that store only).
   const sel = $('tenant') as HTMLSelectElement;
+  if (state.orgs.length) {
+    const g = el('optgroup');
+    g.label = 'Organizations (sign in as org admin)';
+    for (const o of state.orgs) {
+      const opt = el('option', '', `${o.name} · ${o.stores} stores · ${o.reporting_currency}`);
+      opt.value = o.subject;
+      g.appendChild(opt);
+    }
+    sel.appendChild(g);
+  }
   for (const tier of ['XL', 'L', 'M', 'S']) {
     const list = state.tenants.filter((t) => t.tier === tier);
     if (!list.length) continue;
     const g = el('optgroup');
-    g.label = TIER[tier] + 's';
+    g.label = `${TIER[tier]}s (sign in as store owner)`;
     for (const t of list) {
       const o = el('option', '', `${t.name} (${t.slug})${t.status !== 'active' ? ` · ${t.status}` : ''}`);
-      o.value = t.slug;
+      o.value = t.subject;
       g.appendChild(o);
     }
     sel.appendChild(g);
   }
   const url = new URL(location.href);
+  const wantedOrg = url.searchParams.get('org');
   const wanted = url.searchParams.get('tenant');
-  state.slug = state.tenants.some((t) => t.slug === wanted) ? wanted! : state.tenants.find((t) => t.tier === 'XL')?.slug ?? state.tenants[0]?.slug ?? '';
+  if (wantedOrg && state.orgs.some((o) => o.slug === wantedOrg)) {
+    state.kind = 'org';
+    state.slug = wantedOrg;
+  } else {
+    state.slug = state.tenants.some((t) => t.slug === wanted) ? wanted! : state.tenants.find((t) => t.tier === 'XL')?.slug ?? state.tenants[0]?.slug ?? '';
+  }
+  state.as = (state.kind === 'org' ? 'org:' : 'tenant:') + state.slug;
   const r = url.searchParams.get('range') ?? '7d';
   state.range = RANGES.includes(r) && r !== 'custom' ? r : '7d';
   if (r === 'custom' && url.searchParams.get('from') && url.searchParams.get('to')) {
@@ -104,36 +143,21 @@ async function init() {
     state.to = url.searchParams.get('to')!;
   }
   markRange();
-  sel.value = state.slug;
-  sel.addEventListener('change', () => selectTenant(sel.value));
-  const demoOn = await demoAvailable();
-  if (demoOn) {
-    $('demo').classList.replace('hidden', 'flex');
-    wireDemo();
-  }
+  sel.value = state.as;
+  sel.addEventListener('change', () => {
+    const [kind, slug] = sel.value.startsWith('org:') ? ['org', sel.value.slice(4)] : ['store', sel.value.slice(7)];
+    selectScope(kind as Scope, slug, sel.value);
+  });
+  $('back-org').addEventListener('click', () => {
+    if (state.parentOrg) selectScope('org', state.parentOrg.slug, state.parentOrg.subject);
+  });
+  demoOn = await demoAvailable();
+  if (demoOn) wireDemo();
   if (!state.slug) {
     banner('No stores yet. Seed some with: docker compose --profile tools run --rm tpctl seed');
     return;
   }
-  await selectTenant(state.slug);
-  const reloadBench = () =>
-    loadBench(subject())
-      .then((b) => {
-        renderStress($('bench-stress'), b.stress, true);
-        renderWrites($('bench-writes'), b.writestorm, true);
-      })
-      .catch(() => $('bench-card').classList.add('hidden'));
-  reloadBench();
-  if (demoOn)
-    wireStressButtons(
-      [
-        { btn: $('stress-run') as HTMLButtonElement, body: READ_TEST, idle: 'Run stress test', busy: 'Stress test running…' },
-        { btn: $('writes-run') as HTMLButtonElement, body: WRITE_TEST, idle: 'Run write storm', busy: 'Write storm running…' },
-      ],
-      $('stress-progress'),
-      subject(),
-      reloadBench,
-    );
+  await selectScope(state.kind, state.slug, state.as);
   watch();
   window.addEventListener('tp-theme', () => {
     state.chartKey = '';
@@ -144,7 +168,8 @@ async function init() {
 
 function syncURL() {
   const u = new URL(location.href);
-  u.searchParams.set('tenant', state.slug);
+  u.searchParams.delete(state.kind === 'org' ? 'tenant' : 'org');
+  u.searchParams.set(state.kind === 'org' ? 'org' : 'tenant', state.slug);
   u.searchParams.set('range', state.range);
   if (state.range === 'custom') {
     u.searchParams.set('from', state.from);
@@ -164,24 +189,44 @@ function markRange() {
   form.classList.toggle('flex', custom);
 }
 
-async function selectTenant(slug: string) {
+let demoOn = false;
+
+// selectScope shows one store or one org, read with the identity `as`. An org
+// admin opening one of its stores keeps its org identity: that is what lets it
+// read the store (role-based access), and the back button returns to the org.
+async function selectScope(kind: Scope, slug: string, as: string) {
+  state.parentOrg = kind === 'store' && as.startsWith('org:') ? state.orgs.find((o) => o.subject === as) ?? null : null;
+  state.kind = kind;
   state.slug = slug;
+  state.as = as;
   state.version = '';
-  watching?.abort(); // reopen the freshness stream for the new store
+  state.topOffset = 0;
+  watching?.abort(); // reopen the freshness stream for the new scope
   state.firstLoad = true;
   syncURL();
   try {
-    state.info = await get<TenantInfo>(`/v1/tenants/${slug}`, subject());
+    state.info = await get<TenantInfo>(base(), subject());
   } catch (e) {
     banner(`Cannot open ${slug}: ${(e as Error).message}`);
     return;
   }
+  banner(null);
+  const org = kind === 'org';
   const cur = $('currency') as HTMLSelectElement;
   cur.replaceChildren(...state.info.currencies.map((c) => Object.assign(el('option', '', `${c} ${currencySymbol(c)}`), { value: c })));
   state.currency = state.info.currencies.includes(state.info.default_currency) ? state.info.default_currency : state.info.currencies[0];
   cur.value = state.currency;
-  $('tenant-tier').textContent = TIER[state.info.tier] ?? state.info.tier;
-  $('tz').textContent = `${state.info.timezone} · ${state.info.currencies.join(', ')}`;
+  cur.disabled = org; // org money is converted into one reporting currency
+  $('tenant-tier').textContent = org ? `${state.info.stores?.length ?? 0} stores` : TIER[state.info.tier ?? ''] ?? state.info.tier ?? '';
+  $('role').textContent = state.as === 'operator' ? 'Superuser' : state.as.startsWith('org:') ? 'Org admin' : 'Store owner';
+  $('tz').textContent = org
+    ? `Days in your time (${viewerTZ}) · converted to ${state.info.reporting_currency}`
+    : `${state.info.timezone} · ${state.info.currencies.join(', ')}`;
+  $('back-org').classList.toggle('hidden', !state.parentOrg);
+  if (state.parentOrg) $('back-org-name').textContent = state.parentOrg.name;
+  $('org-card').classList.toggle('hidden', !org);
+  $('demo').classList.toggle('hidden', org || !demoOn); // the live demo writes into one store's database
+  $('demo').classList.toggle('flex', !org && demoOn);
   setGrainForRange();
   await refresh();
 }
@@ -202,6 +247,7 @@ function wireControls() {
       return;
     }
     state.range = b.dataset.range!;
+    state.topOffset = 0;
     markRange();
     setGrainForRange();
     syncURL();
@@ -217,13 +263,30 @@ function wireControls() {
     state.range = 'custom';
     state.from = from; // store-local dates; the API resolves them in the store's timezone
     state.to = next.toISOString().slice(0, 10);
+    state.topOffset = 0;
     setGrainForRange();
     syncURL();
     refresh();
   });
   $('currency').addEventListener('change', (ev) => {
     state.currency = (ev.target as HTMLSelectElement).value;
+    state.topOffset = 0;
     refresh();
+  });
+  // Top N: N is the page size; Previous and Next page through the full ranking.
+  const reloadTop = () => loadTop().catch((e) => toast(`Top products failed: ${(e as Error).message}`, 'bad'));
+  $('top-n').addEventListener('change', (ev) => {
+    state.topN = Number((ev.target as HTMLSelectElement).value);
+    state.topOffset = 0;
+    reloadTop();
+  });
+  $('top-prev').addEventListener('click', () => {
+    state.topOffset = Math.max(0, state.topOffset - state.topN);
+    reloadTop();
+  });
+  $('top-next').addEventListener('click', () => {
+    state.topOffset += state.topN;
+    reloadTop();
   });
   $('metric').addEventListener('click', (ev) => {
     const b = (ev.target as HTMLElement).closest<HTMLButtonElement>('button');
@@ -314,7 +377,7 @@ async function refresh(): Promise<void> {
 let summary: Summary | null = null;
 
 async function loadSummary() {
-  const env = await get<Envelope<Summary>>(`/v1/tenants/${state.slug}/orders/summary${qs()}`, subject());
+  const env = await get<Envelope<Summary>>(`${base()}/orders/summary${qs()}`, subject());
   summary = env.data;
   const s = env.data;
   const c = state.currency;
@@ -336,6 +399,55 @@ async function loadSummary() {
   const span = (f: string, t: string) => `${fmt.format(new Date(f))} – ${fmt.format(new Date(Date.parse(t) - 1))}`;
   $('period').textContent = `${span(s.from, s.to)} · change vs ${span(s.previous.from, s.previous.to)}`;
   latency('lat-summary', env);
+  if (state.kind === 'org') renderOrg(s);
+}
+
+// renderOrg shows where the org totals come from: each store's share (opening
+// a store reads it as this org's admin), the exact amounts per currency, and
+// the fixed rates used to convert them.
+function renderOrg(s: Summary) {
+  const c = s.totals[0]?.currency ?? state.currency;
+  const stores = s.stores ?? [];
+  const total = stores.reduce((n, st) => n + Number(st.gross_sales), 0) || 1;
+  $('org-sub').textContent = `${stores.length} stores with orders in this range · gross converted to ${c}`;
+  $('org-gross-h').textContent = `Gross (${c})`;
+  $('org-stores').replaceChildren(
+    ...stores.map((st) => {
+      const r = el('tr', 'border-b hairline last:border-0');
+      const name = el('td', 'max-w-0 py-2 pr-3');
+      const open = el('button', 'truncate text-left font-medium underline-offset-2 hover:underline', st.name);
+      open.type = 'button';
+      open.title = `Open ${st.name} as this org's admin`;
+      open.addEventListener('click', () => selectScope('store', st.slug, state.as));
+      name.append(open, el('div', 'muted truncate text-[11px]', `${st.slug} · ${st.timezone} · sells in ${st.currency}`));
+      const share = (Number(st.gross_sales) / total) * 100;
+      const shareCell = el('td', 'hidden py-2 md:table-cell');
+      const wrap = el('div', 'flex items-center gap-2');
+      const track = el('div', 'h-1.5 flex-1 rounded-full');
+      track.style.background = 'var(--surface-2)';
+      const fill = el('div', 'h-1.5 rounded-full');
+      fill.style.cssText = `width:${share}%;background:var(--series-1)`;
+      track.appendChild(fill);
+      wrap.append(track, el('span', 'muted tabnum w-12 text-right text-xs', pct(share)));
+      shareCell.appendChild(wrap);
+      r.append(name, el('td', 'tabnum py-2 pr-3 text-right', int(st.orders)), el('td', 'tabnum py-2 pr-3 text-right font-semibold whitespace-nowrap', money(st.gross_sales, c)), shareCell);
+      return r;
+    }),
+  );
+  $('org-currencies').replaceChildren(
+    ...(s.by_currency ?? []).map((b) => {
+      const row = el('div', 'flex items-baseline justify-between gap-2');
+      row.title = `${int(b.orders)} orders in ${b.currency}`;
+      row.append(el('span', 'tabnum font-medium', money(b.gross_sales, b.currency)), el('span', 'muted tabnum text-xs', b.currency === c ? '' : `≈ ${money(b.gross_sales_converted, c)}`));
+      return row;
+    }),
+  );
+  const fx = s.fx;
+  if (fx) {
+    const rates = Object.entries(fx.units_per_usd).filter(([k]) => k !== 'USD').map(([k, v]) => `${k} ${Number(v)}`).join(' · ');
+    $('org-fx').textContent = `Converted at fixed rates per 1 USD (as of ${fx.rates_as_of}): ${rates}. Converted totals are approximate; the amounts above are exact.`
+      + (fx.missing_rates.length ? ` No rate for ${fx.missing_rates.join(', ')}: left out of converted totals.` : '');
+  }
 }
 
 function setKPI(id: string, value: string, full: string, now: number, before: number, sub: string) {
@@ -366,7 +478,7 @@ function renderSparks() {
 }
 
 async function loadTrend() {
-  const env = await get<Envelope<Trends>>(`/v1/tenants/${state.slug}/orders/trends${qs({ grain: state.grain, currency: state.currency })}`, subject());
+  const env = await get<Envelope<Trends>>(`${base()}/orders/trends${qs({ grain: state.grain, currency: state.currency })}`, subject());
   state.trend = env.data;
   latency('lat-trends', env);
   renderTrend();
@@ -431,7 +543,7 @@ function fmtBucket(b: string, tr: Trends): string {
 }
 
 async function loadBreakdown() {
-  const env = await get<Envelope<Breakdown>>(`/v1/tenants/${state.slug}/orders/breakdown${qs()}`, subject());
+  const env = await get<Envelope<Breakdown>>(`${base()}/orders/breakdown${qs()}`, subject());
   const rows = env.data.statuses;
   const total = Math.max(1, env.data.total_orders);
   const max = Math.max(1, ...rows.map((r) => r.orders));
@@ -468,8 +580,18 @@ async function loadBreakdown() {
 }
 
 async function loadTop() {
-  const env = await get<Envelope<Top>>(`/v1/tenants/${state.slug}/products/top${qs({ currency: state.currency, limit: '10' })}`, subject());
-  const ps = env.data.products;
+  const env = await get<Envelope<Top>>(
+    `${base()}/products/top${qs({ currency: state.currency, limit: String(state.topN), offset: String(state.topOffset) })}`, subject());
+  const t = env.data;
+  if (!t.products.length && t.offset > 0 && t.total > 0) { // the list got shorter than this page: show its last page
+    state.topOffset = Math.max(0, Math.floor((t.total - 1) / state.topN) * state.topN);
+    return loadTop();
+  }
+  const ps = t.products;
+  $('top-title').textContent = `Top ${state.topN} products`;
+  $('top-range').textContent = ps.length ? `${int(t.offset + 1)}–${int(t.offset + ps.length)} of ${int(t.total)}` : '';
+  ($('top-prev') as HTMLButtonElement).disabled = t.offset === 0;
+  ($('top-next') as HTMLButtonElement).disabled = t.next_offset == null;
   const sum = ps.reduce((n, p) => n + Number(p.revenue), 0) || 1;
   const max = Math.max(1, ...ps.map((p) => Number(p.revenue)));
   const body = $('top-body');
@@ -489,7 +611,8 @@ async function loadTop() {
         rank.append(badge);
         const name = el('td', 'w-full max-w-0 py-2.5 pr-4'); // max-w-0 + w-full: long names truncate instead of widening the table
         name.append(el('div', 'truncate font-medium', p.name));
-        if (p.sku) name.append(el('div', 'muted truncate text-[11px]', p.sku));
+        const sub = [p.store_name, p.sku].filter(Boolean).join(' · '); // org view: which store sold it
+        if (sub) name.append(el('div', 'muted truncate text-[11px]', sub));
         const share = (Number(p.revenue) / sum) * 100;
         const shareCell = el('td', 'hidden py-2.5 md:table-cell');
         const wrap = el('div', 'flex items-center gap-2');
@@ -532,30 +655,30 @@ async function watch() {
       await sleep(500);
       continue;
     }
-    const slug = state.slug;
+    const key = scopeKey();
     const ctl = new AbortController();
     watching = ctl;
     let opened = false;
     try {
-      await stream<Fresh>(`/v1/tenants/${slug}/stream`, subject(), ctl.signal, () => (opened = true), onFresh);
+      await stream<Fresh>(`${base()}/stream`, subject(), ctl.signal, () => (opened = true), onFresh);
     } catch {
-      // network error, API restart, or aborted (store switched, tab hidden)
+      // network error, API restart, or aborted (scope switched, tab hidden)
     }
     if (ctl.signal.aborted) continue;
     if (opened) {
       await sleep(1000); // the stream ended (e.g. API restart): reconnect
       continue;
     }
-    for (const until = Date.now() + 30_000; Date.now() < until && slug === state.slug && !document.hidden; ) {
-      await pollOnce(slug);
+    for (const until = Date.now() + 30_000; Date.now() < until && key === scopeKey() && !document.hidden; ) {
+      await pollOnce();
       await sleep(1000);
     }
   }
 }
 
-async function pollOnce(slug: string) {
+async function pollOnce() {
   try {
-    await onFresh(await get<Fresh>(`/v1/tenants/${slug}/freshness`, subject()));
+    await onFresh(await get<Fresh>(`${base()}/freshness`, subject()));
   } catch {
     lastFresh = null;
     renderFresh(null);
@@ -563,7 +686,7 @@ async function pollOnce(slug: string) {
 }
 
 async function onFresh(f: Fresh) {
-  if (f.tenant !== state.slug) return; // from the store the user just switched away from
+  if (f.scope !== scopeKey()) return; // from the store or org the user just switched away from
   skew = Date.parse(f.server_time) - Date.now();
   lastFresh = f;
   renderFresh(f);
@@ -581,31 +704,37 @@ async function onFresh(f: Fresh) {
   }
 }
 
+// renderFresh shows how fresh the page is: within how many seconds of the
+// store's own database (org: of its slowest store). The server sends a new
+// value only when that changes; while the data is behind, its age counts up
+// here in the browser.
 function renderFresh(f: Fresh | null) {
   const host = $('fresh');
   const dot = el('span', 'chip-dot');
   let label = 'Connecting…', color = '--ink-muted';
+  let tip = 'Connecting to the change feed';
+  const org = state.kind === 'org';
+  const of = org ? 'its stores' : 'the store';
+  const dbs = org ? "its stores' own databases" : "the store's own database";
+  const feed = org ? "the stores' change feeds" : "the store's change feed";
   if (f?.status === 'live') dot.classList.add('live');
-  let tip = 'Connecting to the store’s change feed';
   if (f) {
     const since = (t: string | null) => (t ? Date.now() + skew - Date.parse(t) : null);
     const age = since(f.data_as_of);
     const change = since(f.last_source_commit_at);
-    tip = `Last change in this store: ${change == null ? 'none since the pipeline started' : ago(change)}.`;
+    const within = f.fresh_within_ms ? `${f.fresh_within_ms / 1000} s` : '';
+    tip = `Last change: ${change == null ? 'none since the pipeline started' : ago(change)}.`;
     switch (f.status) {
       case 'live':
-        // Live = the pipeline is confirming continuously that nothing newer
-        // exists; new data is pushed the moment it lands.
-        color = '--good'; label = change == null ? 'Live · up to date' : `Live · last change ${ago(change)}`;
-        tip += ' Up to date: the change feed confirms every second that nothing newer exists, and new data is pushed here as soon as it lands.';
+        color = '--good';
+        label = within ? `Fresh · within ${within} of ${of}` : 'Fresh';
+        tip = `The numbers here are within ${within || '30 s'} of ${dbs}; new data is pushed as soon as it lands. ` + tip;
         break;
       case 'lagging':
-        color = '--warning'; label = `Lagging · data ${ago(age)}`;
-        tip += ' The pipeline is behind: the numbers shown are current as of that time.';
-        break;
       case 'stalled':
-        color = '--critical'; label = 'Pipeline stalled';
-        tip += ' The change feed has not confirmed for over 30 s; the numbers shown may be out of date.';
+        color = age != null && age > 5 * 60_000 ? '--critical' : '--warning';
+        label = `Behind · data from ${ago(age)}`;
+        tip = `The numbers here are as of ${ago(age)}; newer changes are waiting in ${feed}${f.stores_behind ? ` (${f.stores_behind} of ${f.stores} stores behind)` : ''} and appear as soon as they land. ` + tip;
         break;
       default:
         label = f.status === 'snapshotting' ? 'Loading snapshot…' : 'Provisioning…';
@@ -650,14 +779,17 @@ function wireDemo() {
     }),
   );
   $('isolation').addEventListener('click', async () => {
-    const other = state.tenants.find((t) => t.slug !== state.slug);
-    if (!other) return toast('Need at least two stores for this test', 'bad');
+    // A store this identity may not read: any other store for a store owner;
+    // for an org admin, a store outside its org.
+    const myOrg = state.as.startsWith('org:') ? state.as.slice(4) : '';
+    const other = state.tenants.find((t) => t.slug !== state.slug && (!myOrg || t.org !== myOrg));
+    if (!other) return toast('Need a store this identity may not read for this test', 'bad');
     try {
       await get(`/v1/tenants/${other.slug}/orders/summary?range=7d`, subject());
-      toast(`Unexpected: ${state.slug} could read ${other.slug}`, 'bad');
+      toast(`Unexpected: ${state.as} could read ${other.slug}`, 'bad');
     } catch (e) {
       const err = e as ApiError;
-      toast(`Blocked: ${state.slug}'s token asked for ${other.slug} and got HTTP ${err.status}: “${err.body?.detail ?? err.message}”`, 'good', 10000, 'shield-check');
+      toast(`Blocked: the ${state.as} token asked for ${other.slug} and got HTTP ${err.status}: “${err.body?.detail ?? err.message}”`, 'good', 10000, 'shield-check');
     }
   });
   $('compare').addEventListener('click', (ev) => busy(ev.currentTarget as HTMLButtonElement, compare));

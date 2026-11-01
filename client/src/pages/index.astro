@@ -13,19 +13,21 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
 <Layout title="TenantPulse" active="dashboard">
   <div slot="header-right" class="flex min-w-0 items-center">
     <div id="fresh" class="chip" aria-live="polite"><span class="chip-dot" style="background: var(--ink-muted)"></span><span>Connecting…</span></div>
-    <Info align="right" text="How recent the newest store data on this page is. A new order shows up about a second after it commits; idle stores are re-checked every second." />
+    <Info align="right" text="How fresh this page is: how far it is behind the store's own database. A new order shows up about a second after it commits and is pushed here as soon as it lands. Behind means the data shown is older than that." />
   </div>
 
   <!-- Page header + filters (they scope everything below) -->
   <section class="mb-5 flex flex-wrap items-end justify-between gap-4" aria-label="Filters">
     <div class="min-w-0 max-w-full">
-      <div class="mb-1.5 flex items-center"><label for="tenant" class="eyebrow">Store</label><Info align="left" text="Each store is a tenant with its own database. Picking a store signs you in as that store, so you only ever see its data." /></div>
+      <div class="mb-1.5 flex items-center"><label for="tenant" class="eyebrow">View</label><Info align="left" text="Picking a store signs you in as its owner: you see only that store. Picking an org signs you in as its org admin: one dashboard across all its stores, converted into the org's reporting currency, and each of its stores (but no other org's). The superuser (operator) can read everything, including Monitor." /></div>
       <div class="flex flex-wrap items-center gap-2.5">
         <div class="relative min-w-0 max-w-full">
           <Icon name="store" size={16} class="muted pointer-events-none absolute top-1/2 left-3 -translate-y-1/2" />
           <select id="tenant" class="h-11 max-w-full pl-9 text-[15px] font-semibold tracking-tight sm:max-w-[22rem]"></select>
         </div>
         <span id="tenant-tier" class="chip"></span>
+        <span id="role" class="chip" title="The role this page is signed in as"></span>
+        <button id="back-org" class="btn hidden" type="button" title="You opened this store as its org admin"><Icon name="arrow-left" size={14} />Back to <span id="back-org-name"></span></button>
         <span class="muted inline-flex items-center gap-1.5 text-xs"><Icon name="globe" size={13} /><span id="tz"></span></span>
       </div>
     </div>
@@ -66,7 +68,7 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
         <option value="summary">Totals</option>
         <option value="breakdown">Status breakdown</option>
         <option value="trends">Trend</option>
-        <option value="top">Top 10 products</option>
+        <option value="top">Top products</option>
       </select>
       <button id="compare" class="btn" type="button"><Icon name="arrow-left-right" size={15} />Compare with direct SQL</button>
       <span class="mx-1 hidden h-6 w-px sm:block" style="background: var(--ring)"></span>
@@ -98,6 +100,37 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
     <span class="muted inline-flex items-center gap-1.5"><Icon name="calendar" size={13} /><span id="period"></span></span>
     <Info align="left" text="Every widget shows how it was answered. Served from cache = repeat view of unchanged data (well under a millisecond). Computed in memory = first view after new data arrived, added up from the API's in-memory copy of the rollups (updated with one small read per change). Computed in ClickHouse = a range the in-memory copy cannot answer exactly, such as exact times. From cache · refreshing = the previous answer (at most 5 s old) while the new one is computed; the widget updates a second later. The dashboard never queries the store database." />
   </div>
+
+  <!-- Org view only: where the consolidated numbers come from -->
+  <section id="org-card" class="card mb-4 hidden min-w-0 p-5" aria-label="Stores in this org">
+    <div class="mb-3 flex items-start gap-3">
+      <span class="icon-tile"><Icon name="store" size={16} /></span>
+      <div class="min-w-0">
+        <h2 class="card-title flex items-center">Stores in this org<Info align="left" text="Each store's share of the org totals above, converted into the org's reporting currency. Open a store to see its own dashboard: as org admin you may read every store in your org, and no other." /></h2>
+        <span id="org-sub" class="muted text-xs"></span>
+      </div>
+    </div>
+    <div class="grid gap-5 lg:grid-cols-3">
+      <div class="min-w-0 lg:col-span-2">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b hairline text-left">
+              <th class="py-2 font-medium">Store</th>
+              <th class="py-2 pr-3 text-right font-medium">Orders</th>
+              <th class="py-2 pr-3 text-right font-medium" id="org-gross-h">Gross</th>
+              <th class="hidden w-40 py-2 font-medium md:table-cell">Share</th>
+            </tr>
+          </thead>
+          <tbody id="org-stores"></tbody>
+        </table>
+      </div>
+      <div class="min-w-0">
+        <div class="eyebrow mb-2 flex items-center">By currency (exact)<Info align="right" text="Gross sales per currency as recorded, before conversion. The org totals above are these, converted at the fixed rates below." /></div>
+        <div id="org-currencies" class="space-y-1.5 text-sm"></div>
+        <p id="org-fx" class="muted mt-3 text-[11.5px]"></p>
+      </div>
+    </div>
+  </section>
 
   <section class="grid gap-4 lg:grid-cols-3">
     <div class="card min-w-0 p-5 lg:col-span-2" id="trend-card">
@@ -149,11 +182,21 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
   </section>
 
   <section class="card mt-4 min-w-0 p-5">
-    <div class="mb-3 flex items-start gap-3">
+    <div class="mb-3 flex flex-wrap items-start gap-3">
       <span class="icon-tile"><Icon name="package" size={16} /></span>
-      <div>
-        <h2 class="card-title flex items-center">Top 10 products<Info align="left" text="Products ranked by line revenue (quantity x unit price) from recognized orders in the selected currency. Taxes and shipping are not included, so this differs from gross sales." /></h2>
+      <div class="min-w-0">
+        <h2 class="card-title flex items-center"><span id="top-title">Top products</span><Info align="left" text="Products ranked by line revenue (quantity x unit price) from recognized orders in the selected currency. Taxes and shipping are not included, so this differs from gross sales. Pick how many to show; Next and Previous page through the rest." /></h2>
         <span class="muted text-xs">By recognized line revenue (quantity × unit price)</span>
+      </div>
+      <div class="ml-auto flex items-center gap-2 text-xs">
+        <label for="top-n" class="muted">Show top</label>
+        <select id="top-n" aria-label="How many products per page">
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
       </div>
     </div>
     <table class="w-full text-sm">
@@ -163,31 +206,19 @@ const kpis: { id: string; label: string; icon: IconName; tip: string }[] = [
           <th class="py-2.5 font-medium">Product</th>
           <th class="py-2.5 pr-3 text-right font-medium whitespace-nowrap sm:pr-6">Units</th>
           <th class="py-2.5 pr-3 text-right font-medium whitespace-nowrap sm:pr-6">Revenue</th>
-          <th class="hidden w-56 py-2.5 font-medium whitespace-nowrap md:table-cell">Share of top 10</th>
+          <th class="hidden w-56 py-2.5 font-medium whitespace-nowrap md:table-cell">Share of this page</th>
         </tr>
       </thead>
       <tbody id="top-body"></tbody>
     </table>
-    <div class="mt-3"><span id="lat-top" class="chip"></span></div>
-  </section>
-
-  <section id="bench-card" class="card mt-4 min-w-0 p-5" aria-label="Direct database vs aggregation layer">
-    <div class="mb-4 flex flex-wrap items-start gap-3">
-      <span class="icon-tile"><Icon name="gauge" size={16} /></span>
-      <div class="mr-auto min-w-0">
-        <h2 class="card-title flex items-center">Direct primary DB vs this aggregation layer<Info align="left" text="Latest stress test: two API instances with identical endpoints under the same concurrent load. One queries each store's primary Postgres on every request; the other uses ClickHouse plus the version-keyed cache. Store checkout traffic runs on the primary throughout, so you also see how much each slows the store down." /></h2>
-        <p class="muted text-xs">Same questions, same data, same load: how fast dashboards answer, and what it costs the store's database</p>
-      </div>
-      <div class="flex flex-wrap items-center gap-2">
-        <a href="/monitor#bench" class="link inline-flex items-center gap-1 px-1 text-xs">Full results<Icon name="arrow-up-right" size={13} /></a>
-        <button id="stress-run" class="btn btn-primary hidden" type="button" title="Read stress: 20 users hammer the dashboards with no pause while stores take light traffic. 4 phases of about 18 s: baseline, direct primary DB, aggregation layer, ClickHouse only."><Icon name="play" size={13} />Run stress test</button>
-        <button id="writes-run" class="btn btn-primary hidden" type="button" title="Write storm: every store takes about 1,000 transactions/s in total (checkouts, status changes, cancellations) while 100 dashboard viewers watch. 3 phases of about 25 s."><Icon name="play" size={13} />Run write storm</button>
+    <div class="mt-3 flex flex-wrap items-center justify-between gap-2">
+      <span id="lat-top" class="chip"></span>
+      <div class="flex items-center gap-2 text-xs">
+        <span id="top-range" class="muted tabnum"></span>
+        <button id="top-prev" class="btn" type="button" disabled><Icon name="arrow-left" size={14} />Previous</button>
+        <button id="top-next" class="btn" type="button" disabled>Next<Icon name="arrow-right" size={14} /></button>
       </div>
     </div>
-    <div id="stress-progress" class="panel mb-4 hidden px-4 py-3"></div>
-    <div id="bench-stress"><p class="muted text-sm">Loading benchmark…</p></div>
-    <h3 class="mt-7 mb-3 flex items-center gap-2 text-sm font-semibold"><Icon name="flame" size={15} class="muted" />Write storm: every store writing at once<Info align="left" text="The other real-world stress: all stores taking orders, status changes and cancellations at a high rate while people watch their dashboards. Shows how much the stores slow down, how fast a new order reaches the dashboard, and dashboard speed, with dashboards on this layer and, for contrast, on the store databases." /></h3>
-    <div id="bench-writes"><p class="muted text-sm">Loading…</p></div>
   </section>
 
   <dialog id="compare-dialog" class="card m-auto w-[min(48rem,calc(100vw-2rem))] p-0" style="color: var(--ink); box-shadow: var(--shadow-pop)">

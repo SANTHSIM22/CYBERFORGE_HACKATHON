@@ -18,6 +18,19 @@ const paths: { key: string; title: string; sub: string; color: string; cached: b
   { key: 'clickhouse', title: 'ClickHouse only (cache bypassed)', sub: 'api · benchmark reads that skip cache and views', color: '--series-3', cached: false },
   { key: 'aggregation', title: 'Aggregation layer (ClickHouse + cache)', sub: 'api · normal dashboard reads', color: '--series-1', cached: true },
 ];
+// PRD targets and the measured results (docs/RESULTS.md, 10M records, 100 stores).
+const scorecard: { measure: string; how: string; good: string; great: string; result: string; verdict: string; met: boolean }[] = [
+  { measure: 'Query speed', how: 'Time for each dashboard query at 10M records', good: 'Under 1 second', great: 'Under 200 ms',
+    result: '≤ 77 ms p95 per query, cold in ClickHouse (all 9 queries); p99 84 ms through the API at 1,297 req/s, 0 errors', verdict: 'Great', met: true },
+  { measure: 'Freshness', how: 'Time from adding an order to seeing it in the numbers', good: 'Under 5 minutes', great: 'Under 30 seconds',
+    result: '1.8 s p95 (30 orders)', verdict: 'Great', met: true },
+  { measure: 'Database safety', how: 'Normal app query time, with and without dashboard load', good: 'Less than 25% slower', great: 'Less than 10% slower',
+    result: 'Store p95 355 ms with 100 dashboards on this layer vs 375 ms with no dashboards and the pipeline off: 5% faster, not slower (300 tx/s write storm). 0 dashboard queries reach the store databases', verdict: 'Great', met: true },
+  { measure: 'Correctness', how: 'Compare your numbers with a direct database query', good: 'Matches on most queries', great: 'Matches on all queries',
+    result: '8,724 / 8,724 checks match exactly: 100 stores (every widget, top N pages) and 10 org dashboards in 3 timezones', verdict: 'Great', met: true },
+  { measure: 'Growth', how: 'Query speed at 1M vs 10M records', good: 'Less than 5× slower', great: 'Less than 2× slower',
+    result: '1.11–1.86× slower (p50, all 9 queries)', verdict: 'Great', met: true },
+];
 const charts: { id: string; title: string; icon: IconName; tip: (p: (typeof paths)[number]) => string }[] = [
   { id: 'rps', title: 'Requests per second', icon: 'activity', tip: (p) => `${p.title}: API reads per second over the last 60 seconds.` },
   { id: 'p95', title: 'Query time p95', icon: 'gauge', tip: (p) => `${p.title}: per-second 95th-percentile server time of reads.` },
@@ -72,6 +85,47 @@ const charts: { id: string; title: string; icon: IconName; tip: (p: (typeof path
       </div>
     </section>
   ))}
+
+  <section id="scorecard" class="card mt-4 min-w-0 scroll-mt-20 p-5" aria-label="Results against the PRD targets">
+    <div class="mb-4 flex items-start gap-3">
+      <span class="icon-tile"><Icon name="badge-check" size={16} /></span>
+      <div class="min-w-0">
+        <h2 class="card-title flex items-center">Results against the PRD targets<Info align="left" text="The targets from the requirements, and what we measured at 10M records across 100 stores. Full tables, method and the result files: docs/RESULTS.md." /></h2>
+        <p class="muted text-xs">10M records · 100 stores · CPU-pinned runs</p>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full min-w-[44rem] text-sm">
+        <thead>
+          <tr class="border-b hairline text-left">
+            <th class="py-2.5 pr-3 font-medium">What we measure</th>
+            <th class="py-2.5 pr-3 font-medium">How</th>
+            <th class="py-2.5 pr-3 font-medium whitespace-nowrap">Good</th>
+            <th class="py-2.5 pr-3 font-medium whitespace-nowrap">Great</th>
+            <th class="py-2.5 pr-3 font-medium">Measured</th>
+            <th class="py-2.5 font-medium">Verdict</th>
+          </tr>
+        </thead>
+        <tbody>
+          {scorecard.map((r) => (
+            <tr class="border-b hairline align-top last:border-0">
+              <td class="py-3 pr-3 font-semibold whitespace-nowrap">{r.measure}</td>
+              <td class="ink-2 py-3 pr-3">{r.how}</td>
+              <td class="ink-2 py-3 pr-3">{r.good}</td>
+              <td class="ink-2 py-3 pr-3">{r.great}</td>
+              <td class="tabnum py-3 pr-3">{r.result}</td>
+              <td class="py-3">
+                <span class="chip whitespace-nowrap font-semibold" style={r.met
+                  ? 'background: var(--good-wash); color: var(--good-text)'
+                  : 'background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--ink)'}>{r.verdict}</span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+    <p class="muted mt-3 text-[11.5px]">Database safety: by design no dashboard query reaches a store database; Postgres' own transaction counters show it.</p>
+  </section>
 
   <section id="bench" class="card mt-4 min-w-0 scroll-mt-20 p-5" aria-label="Direct database vs aggregation layer">
     <div class="mb-4 flex flex-wrap items-start gap-3">

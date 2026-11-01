@@ -1,0 +1,81 @@
+TenantPulse Benchmark Results
+
+Scorecard Against PRD Targets
+Target,Good/Great Threshold,1M (10 stores),10M (100 stores),Verdict
+Query speed at 10M,< 1s / < 200ms,Cold ClickHouse ≤ 62ms p95,Cold ClickHouse ≤ 77ms p95; API at 1297 req/s: p95 41ms p99 84ms 0 errors,✅ Great
+Freshness (order → numbers),< 5min / < 30s,p95 1.7s,p95 1.8s,✅ Great
+Correctness vs direct SQL,most / all,701/701 exact,6932/6932 exact,✅ Great
+Growth 1M → 10M,< 5× / < 2×,-,all 9 queries 1.11-1.86× (p50),✅ Great
+Database safety,< 25% / < 10%,-,Dashboards sent 0 queries to stores; store p95 +97% (shared CPU),⚠️ Not met as measured
+
+Data Summary
+Metric,1M Run,10M Run
+Stores,10,100
+Total Rows,1000029,9995884
+Orders,314462,3144565
+Order Lines,644700,6445771
+Largest Store Orders,133814,816793
+
+Correctness Verification
+Metric,1M,10M
+Stores Checked,10,100
+Total Checks,701,6932
+Stores with Mismatch,0,0
+
+Query Speed and Growth (Largest Store p50/p95)
+Query,Store DB B-tree 1M,Store DB B-tree 10M,Store DB Covering 10M,ClickHouse 1M,ClickHouse 10M,ClickHouse Growth,Store DB Growth
+totals 7d,10.4ms / -,56.9ms / -,13.8ms / 17.3ms,15.3ms / 20.8ms,17.0ms / 27.0ms,1.11×,5.5×
+totals 30d,20.3ms / -,72.1ms / -,40.5ms / 61.0ms,12.6ms / 20.1ms,17.3ms / 24.9ms,1.37×,3.5×
+totals 365d,69.3ms / -,299ms / -,285ms / 529ms,12.7ms / 17.6ms,23.6ms / 32.8ms,1.86×,4.3×
+daily trend 7d,24.0ms / -,78.1ms / -,20.7ms / 24.4ms,13.6ms / 21.1ms,15.1ms / 32.7ms,1.11×,3.3×
+daily trend 30d,52.0ms / -,160ms / -,99.4ms / 113ms,16.6ms / 31.9ms,18.8ms / 41.1ms,1.13×,3.1×
+daily trend 365d,324ms / -,1.33s / -,1.04s / 1.53s,16.2ms / 48.2ms,18.7ms / 34.0ms,1.15×,4.1×
+top-10 products 7d,46.3ms / -,228ms / -,143ms / 272ms,26.6ms / 40.7ms,39.3ms / 76.9ms,1.48×,4.9×
+top-10 products 30d,76.7ms / -,439ms / -,479ms / 1.09s,26.8ms / 44.4ms,44.0ms / 65.4ms,1.64×,5.7×
+top-10 products 365d,403ms / -,2.47s / -,2.76s / 4.13s,44.9ms / 62.2ms,59.9ms / 76.3ms,1.33×,6.1×
+
+Freshness (p50/p95/p99)
+Measured To,1M,10M
+Queryable in ClickHouse,87.1ms / 1.03s / 1.04s,981ms / 1.04s / 1.10s
+Visible through Dashboard API,834ms / 1.73s / 1.78s,1.48s / 1.79s / 1.94s
+
+Database Safety - Store Transactions (p50/p95/p99)
+Metric,1M,10M
+Store Rate (tx/s target),-,263 (300)
+Without Dashboards,-,68.9ms / 181ms / 351ms
+With 100 Dashboard Viewers,-,104ms / 355ms / 628ms
+Change at p95,-,+96.6%
+Change at p50,-,+51.2%
+Dashboard Queries to Stores,-,"1476 (baseline: 1458)"
+Dashboard Reads Served,-,48.5ms / 4.79s / 5.45s
+
+Change Capture Cost (p50/p95/p99)
+Metric,1M,10M
+Capture Paused,1.2ms / 13.9ms / 19.7ms,3.1ms / 27.9ms / 65.3ms
+Capture Running,1.9ms / 17.4ms / 30.5ms,10.4ms / 101ms / 194ms
+Change at p95,+25.1%,+260.6%
+
+Read Stress Test (20 users no pause p50/p95/p99)
+Phase,1M req/s,1M Latency,10M req/s,10M Latency,Errors (1M/10M)
+Direct: Query Primary DB,90,86.1ms / 838ms / 2.07s,7,1.03s / 4.78s / 5.41s,0 / 37
+Aggregation Layer (ClickHouse + Cache),3034,4.2ms / 18.2ms / 31.8ms,1297,8.7ms / 40.7ms / 84.3ms,0 / 0
+ClickHouse Only (Cache Bypassed),64,277ms / 600ms / 919ms,45,391ms / 891ms / 1.19s,0 / 0
+
+Write Storm (1000 tx/s total 100 viewers)
+Phase,Scale,Store tx/s,Store Latency,Dashboard Latency,New Order Visible,Ingest events/s
+Pipeline Off (capture paused),1M,747,23.2ms / 122ms / 491ms,-,-,-
+Store writes pipeline on no viewers,1M,399,75.2ms / 340ms / 697ms,-,4.12s / 6.37s / 9.38s,3973
+Store writes + dashboards aggregation,1M,377,54.0ms / 428ms / 1.92s,17.4ms / 566ms / 951ms,4.27s / 6.29s / 7.18s,683
+Store writes + dashboards query primary,1M,147,200ms / 1.11s / 1.52s,637ms / 4.30s / 5.48s,instant (reads DB),379
+Pipeline Off (capture paused),10M,866,33.0ms / 113ms / 211ms,-,-,-
+Store writes pipeline on no viewers,10M,362,105ms / 339ms / 520ms,-,26.75s / 32.17s / 33.17s,6
+Store writes + dashboards aggregation,10M,448,87.3ms / 253ms / 402ms,28.4ms / 3.72s / 4.31s,-,760
+Store writes + dashboards query primary,10M,144,242ms / 877ms / 1.47s,436ms / 4.36s / 5.58s,instant (reads DB),134
+
+Test Environment
+Component,Details
+Machine,AMD Ryzen 5 7520U (4 cores/8 threads 15W) - Docker Desktop on Windows 11
+Data Generation,tpctl seed (deterministic) - Real platform size skew distribution
+1M Run,10 stores full suite (bench/results/suite-1M-20261031-173754.log)
+10M Run,100 stores full suite (bench/results/suite-10M-20261031-191603.log)
+CPU Pinning,Store Postgres: CPUs 0-2; ClickHouse: CPUs 3-5; Others: CPUs 6-7

@@ -41,10 +41,16 @@ Check status: `docker compose ps` (all services `healthy`), then
 
 ## Using the dashboard
 
-1. **Pick a tenant** (top-left). Picking a tenant logs in *as that store*.
-   Its token can only read that store.
+1. **Pick who you are** (top-left). Each choice signs in with one role:
+   - **An organization** signs in as its **org admin**: one consolidated
+     dashboard across all its stores, money converted into the org's
+     reporting currency at fixed rates (the exact per-currency amounts are
+     shown too), and a table of its stores. Clicking a store opens it as the
+     org admin; stores of other orgs answer HTTP 403.
+   - **A store** signs in as its **store owner**: that store only.
+   - The **superuser** (`operator`) reads every org and store, and Monitor.
 2. **Pick a range**: Today / 7 / 30 / 90 days / Custom. Presets are whole
-   days in the store's own timezone.
+   days in the store's own timezone; on an org dashboard, in *your* timezone.
 3. **Live demo row** (needs `DEMO_MODE=true`, the default in `.env.example`):
    - **+ Add random order** writes a real order into the store's database.
      The message shows how many seconds it took to appear on the dashboard.
@@ -57,30 +63,45 @@ Check status: `docker compose ps` (all services `healthy`), then
    - **Try cross-tenant read** uses this store's token to request another
      store's numbers. The API refuses with HTTP 403.
 4. Every widget states its own speed: *"Answered in 0.1 ms (cache hit) · 3 ms round trip"*.
-5. The badge at the top right shows freshness: *"Live · last change 4m ago"*.
-   New data is pushed to the page the moment it lands; the badge turns
-   *Lagging* or *Pipeline stalled* if the pipeline falls behind or stops.
+5. **Top products**: pick N (5 to 100); Previous / Next page through the rest.
+6. The badge at the top right shows how fresh the page is: *"Fresh · within
+   2 s of the store"* (an org: of its slowest store). New data is pushed to
+   the page the moment it lands. If the pipeline falls behind, it reads
+   *"Behind · data from 45s ago"*, counting up until it catches up.
 
 ## REST API
 
 ```bash
-# dev login (AUTH_MODE=dev): get a token for one store, or "operator" for all
+# dev login (AUTH_MODE=dev): one token per role
+#   "tenant:tenant-001" store owner · "org:aurora" org admin · "operator" superuser
 TOKEN=$(curl -s -X POST localhost:8080/v1/dev/login -H 'Content-Type: application/json' \
   -d '{"subject":"tenant:tenant-001"}' | jq -r .token)
 
 curl -H "Authorization: Bearer $TOKEN" "localhost:8080/v1/tenants/tenant-001/orders/summary?range=7d"
 ```
 
+| Role (token subject) | Store dashboards | Org dashboards | Monitor |
+|---|---|---|---|
+| Store owner (`tenant:<store>`) | that store | — | — |
+| Org admin (`org:<org>`) | every store in the org | that org | — |
+| Superuser (`operator`) | all | all | yes |
+
+Anything else answers HTTP 403, the same answer as for something that does
+not exist. The dev login issues any role without a password; a real identity
+provider (OIDC/JWT) replaces it without touching the handlers.
+
 | Endpoint | PRD |
 |---|---|
 | `GET /v1/tenants/{t}/orders/summary?range=7d` (or `from`/`to`, `currency`) | FR-1 counts and totals per currency |
 | `GET /v1/tenants/{t}/orders/count?...` | FR-1 alias from the PRD |
 | `GET /v1/tenants/{t}/orders/trends?range=30d&grain=day\|hour&currency=` | FR-2 |
-| `GET /v1/tenants/{t}/products/top?range=7d&limit=10&currency=` | FR-3 |
+| `GET /v1/tenants/{t}/products/top?range=7d&limit=10&offset=0&currency=` | FR-3 top N: `limit` = N (1–100), `offset` pages through the rest; returns `total` and `next_offset` |
 | `GET /v1/tenants/{t}/orders/breakdown?range=7d` | FR-4 current status of orders created in range |
 | `GET /v1/tenants/{t}/freshness` | B-1 |
 | `GET /v1/tenants/{t}/stream` | B-1 pushed: the same body as Server-Sent Events, sent only when the store's data or pipeline health changes (the dashboard uses this instead of polling) |
 | `GET /v1/tenants/{t}` | timezone, currencies, status |
+| `GET /v1/orgs` | the orgs this token may read |
+| `GET /v1/orgs/{o}/orders/summary\|trends\|breakdown`, `/products/top`, `/freshness`, `/stream` (add `tz=Asia/Kolkata`) | Org dashboard across its stores: days in the viewer's `tz`, money converted into the org's reporting currency (`fx` shows the rates; `by_currency` the exact amounts), `stores` each store's share |
 | `GET /v1/admin/stats` (operator) | B-5; per-second series for dashboard reads and, separately, cache-bypassed benchmark reads |
 | `GET /metrics` | Prometheus |
 
@@ -99,6 +120,8 @@ All commands run inside Docker: `docker compose --profile tools run --rm tpctl <
 | Add one tenant (live, no restart) | `tenant add --slug tenant-004` |
 | Add 5 more / ensure at least N (never removes any) | `tenant add-batch --count 5` · `tenant ensure --count 10` |
 | List / inspect | `tenant list` · `tenant status --slug tenant-001` |
+| Orgs: list, create, move stores, demo grouping | `org list` · `org add --slug acme --name "Acme" --currency INR` · `org assign --org acme --stores tenant-001,tenant-002` · `org demo --size 10` |
+| Conversion rates for org dashboards | `fx list` · `fx set --currency INR --per-usd 88.25` |
 | Add rows to a live tenant (streams through) | `seed-additive --slug tenant-002 --rows 20000` |
 | **Prove correctness** against direct SQL | `verify` |
 | Rebuild a tenant into a new generation (B-2) | `rebuild --slug tenant-002` |

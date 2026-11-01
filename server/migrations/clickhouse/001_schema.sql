@@ -286,3 +286,16 @@ CREATE TABLE IF NOT EXISTS tp.product_q_rollup
 ENGINE = ReplacingMergeTree(_version)
 ORDER BY (tenant_id, generation, q, currency, product_id)
 SETTINGS index_granularity = 256
+;
+
+-- Org dashboards read the 15-minute cells (any viewer-local day is a whole set
+-- of them), under the same per-store row policy as every other API read.
+-- The ingester's allow-all policy is created first: once a table has a row
+-- policy, users it does not name may see no rows, and the ingester rebuilds
+-- the rollups from these cells.
+CREATE ROW POLICY IF NOT EXISTS allow_service ON tp.order_q_rollup FOR SELECT USING 1 TO tp_ingest;
+CREATE ROW POLICY IF NOT EXISTS allow_service ON tp.product_q_rollup FOR SELECT USING 1 TO tp_ingest;
+GRANT SELECT ON tp.order_q_rollup TO tp_api;
+GRANT SELECT ON tp.product_q_rollup TO tp_api;
+CREATE ROW POLICY IF NOT EXISTS tenant_scope ON tp.order_q_rollup FOR SELECT USING tenant_id = toUUID(getSetting('SQL_tenant_id')) TO tp_api;
+CREATE ROW POLICY IF NOT EXISTS tenant_scope ON tp.product_q_rollup FOR SELECT USING tenant_id = toUUID(getSetting('SQL_tenant_id')) TO tp_api

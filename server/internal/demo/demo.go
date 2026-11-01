@@ -73,7 +73,7 @@ func (s *Service) authorize(c *gin.Context) {
 		s.Reg.RefreshIfStale(c)
 		t = s.Reg.Current().BySlug[c.Param("tenant")]
 	}
-	if t == nil || !id.CanRead(t.Slug) {
+	if t == nil || !id.CanRead(t.Slug, t.OrgSlug()) {
 		c.AbortWithStatusJSON(403, gin.H{"error": "forbidden"})
 		return
 	}
@@ -478,7 +478,7 @@ func (s *Service) runDirect(ctx context.Context, pool *pgxpool.Pool, t *registry
 		if limit == 0 {
 			limit = 10
 		}
-		top, err := directsql.TopProducts(ctx, tx, from, to, cur, limit)
+		top, _, err := directsql.TopProducts(ctx, tx, from, to, cur, limit, 0)
 		if err != nil {
 			return "", nil, nil, nil, err
 		}

@@ -73,11 +73,18 @@ func run(ctx context.Context) error {
 	queryTimeout := config.Duration("API_QUERY_TIMEOUT", 5*time.Second)
 	if !direct {
 		go cache.PollVersions(ctx, chMon, config.Duration("API_VERSION_POLL", 250*time.Millisecond))
+		go cache.SweepExpired(ctx, time.Minute)
 		if config.Bool("API_VIEWS", true) { // in-memory rollup views; ClickHouse answers the rest
 			vb := &api.ViewBackend{ClickHouseBackend: backend.(api.ClickHouseBackend), Version: cache.Version, Timeout: queryTimeout,
-				Wait: config.Duration("API_VIEW_WAIT", time.Second)}
+				Wait: config.Duration("API_VIEW_WAIT", time.Second), Idle: config.Duration("API_VIEW_IDLE", 15*time.Minute)}
 			backend = vb
-			go vb.Prewarm(ctx, reg.Current().Ordered, config.Int("API_VIEW_PREWARM", 4))
+			go vb.EvictIdle(ctx, time.Minute)
+			// Loads every store's view at start. With several API copies behind
+			// per-store routing, set 0: each copy then loads only the stores
+			// routed to it, on their first read.
+			if n := config.Int("API_VIEW_PREWARM", 4); n > 0 {
+				go vb.Prewarm(ctx, reg.Current().Ordered, n)
+			}
 		}
 	}
 	srv := &api.Server{

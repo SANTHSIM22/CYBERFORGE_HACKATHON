@@ -130,7 +130,7 @@ func seedCmd(ctx context.Context, e *env, args []string) error {
 		fmt.Printf("capture started for %d deferred tenants; the ingester snapshots them (max %d at a time per cluster)\n",
 			k, config.Int("MAX_CONCURRENT_SNAPSHOTS", 2))
 	}
-	return nil
+	return demoOrgs(ctx, e, 10, false) // a fresh fleet gets demo orgs; existing orgs are left alone
 }
 
 func loadSeedTenants(ctx context.Context, e *env, n int) ([]*seedTenant, error) {

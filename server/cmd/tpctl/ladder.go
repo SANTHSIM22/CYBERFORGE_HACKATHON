@@ -74,8 +74,11 @@ func ladderCmd(ctx context.Context, e *env, args []string) error {
 				},
 				func() error { _, err := chq.Trend(ctx, e.chAPI, p); return err }},
 			query{fmt.Sprintf("top-10 products %dd", days), r,
-				func(tx pgx.Tx) error { _, err := directsql.TopProducts(ctx, tx, r.From, r.To, t.cur, 10); return err },
-				func() error { _, err := chq.TopProducts(ctx, e.chAPI, p); return err }},
+				func(tx pgx.Tx) error {
+					_, _, err := directsql.TopProducts(ctx, tx, r.From, r.To, t.cur, 10, 0)
+					return err
+				},
+				func() error { _, _, err := chq.TopProducts(ctx, e.chAPI, p); return err }},
 		)
 	}
 

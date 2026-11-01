@@ -33,6 +33,21 @@ func (s *Server) stream(c *gin.Context) {
 		abort(c, 404, "not_found", "the direct benchmark backend has no stream; poll /freshness")
 		return
 	}
+	s.sse(c, func() (gin.H, string, <-chan struct{}, func()) {
+		if cur := s.lookup(key); cur != nil {
+			t = cur // status and generation can change under a long-lived stream
+		}
+		changed := s.Cache.Changed(t.ID, t.ActiveGeneration) // taken before reading, so no change is missed
+		st, _ := s.Cache.Status(t.ID, t.ActiveGeneration)
+		body, state := s.freshnessBody(t, st, time.Now())
+		return body, state, changed, func() {}
+	})
+}
+
+// sse runs one Server-Sent Events response: step returns the current body,
+// a state string (an event is written only when it changes), a channel that
+// closes when the state may have changed, and a release for that channel.
+func (s *Server) sse(c *gin.Context, step func() (body gin.H, state string, changed <-chan struct{}, release func())) {
 	rc := http.NewResponseController(c.Writer)
 	// The server's WriteTimeout bounds a whole response; a stream is open-ended.
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
@@ -52,35 +67,34 @@ func (s *Server) stream(c *gin.Context) {
 	defer keepalive.Stop()
 	var last string
 	for {
-		if cur := s.lookup(key); cur != nil {
-			t = cur // status and generation can change under a long-lived stream
-		}
-		changed := s.Cache.Changed(t.ID, t.ActiveGeneration) // taken before reading, so no change is missed
-		st, _ := s.Cache.Status(t.ID, t.ActiveGeneration)
-		if body, state := s.freshnessBody(t, st, time.Now()); state != last {
+		body, state, changed, release := step()
+		if state != last {
 			b, err := json.Marshal(body)
+			if err == nil {
+				_, err = fmt.Fprintf(c.Writer, "event: freshness\ndata: %s\n\n", b)
+			}
+			if err == nil {
+				err = rc.Flush()
+			}
 			if err != nil {
-				return
-			}
-			if _, err := fmt.Fprintf(c.Writer, "event: freshness\ndata: %s\n\n", b); err != nil {
-				return
-			}
-			if err := rc.Flush(); err != nil {
+				release()
 				return
 			}
 			last = state
 		}
+		var err error
 		select {
 		case <-ctx.Done():
-			return
+			err = ctx.Err()
 		case <-changed:
 		case <-keepalive.C: // not an event: the dashboard never sees it
-			if _, err := io.WriteString(c.Writer, ": keepalive\n\n"); err != nil {
-				return
+			if _, err = io.WriteString(c.Writer, ": keepalive\n\n"); err == nil {
+				err = rc.Flush()
 			}
-			if err := rc.Flush(); err != nil {
-				return
-			}
+		}
+		release()
+		if err != nil {
+			return
 		}
 	}
 }

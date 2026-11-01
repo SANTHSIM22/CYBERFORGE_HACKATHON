@@ -43,7 +43,8 @@ ORDER BY 1`
 
 const TopProductsSQL = `SELECT i.product_id::text, p.name, p.sku,
        sum(i.quantity)::text AS quantity,
-       sum(i.quantity * i.unit_price) AS revenue
+       sum(i.quantity * i.unit_price) AS revenue,
+       count(*) OVER () AS total
 FROM orders o
 JOIN order_items i ON i.order_id = o.id AND i.deleted_at IS NULL
 JOIN products p ON p.id = i.product_id
@@ -51,7 +52,7 @@ WHERE o.deleted_at IS NULL AND o.currency = $3 AND o.status = ANY($4::text[])
   AND o.created_at >= $1 AND o.created_at < $2
 GROUP BY i.product_id, p.name, p.sku
 ORDER BY revenue DESC, i.product_id
-LIMIT $5`
+LIMIT $5 OFFSET $6`
 
 const SummarySQL = `SELECT currency::text,
        count(*) FILTER (WHERE created_at >= $2),
@@ -138,25 +139,28 @@ func Trend(ctx context.Context, q Querier, from, to time.Time, tz, grain, curren
 	return out, rows.Err()
 }
 
-func TopProducts(ctx context.Context, q Querier, from, to time.Time, currency string, limit int) ([]chq.TopProduct, error) {
-	rows, err := q.Query(ctx, TopProductsSQL, from, to, currency, domain.RecognizedStatuses, limit)
+// TopProducts returns one page of products ranked by recognized revenue
+// (ranks offset+1 .. offset+limit) and how many products sold in the range.
+func TopProducts(ctx context.Context, q Querier, from, to time.Time, currency string, limit, offset int) ([]chq.TopProduct, int, error) {
+	rows, err := q.Query(ctx, TopProductsSQL, from, to, currency, domain.RecognizedStatuses, limit, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 	var out []chq.TopProduct
+	var total int64
 	for rows.Next() {
 		var tp chq.TopProduct
 		var qty string
 		var rev decimal.Decimal
 		var revText string
-		if err := rows.Scan(&tp.ProductID, &tp.Name, &tp.SKU, &qty, &revText); err != nil {
-			return nil, err
+		if err := rows.Scan(&tp.ProductID, &tp.Name, &tp.SKU, &qty, &revText, &total); err != nil {
+			return nil, 0, err
 		}
 		rev = decimal.RequireFromString(revText)
-		tp.Rank = len(out) + 1
+		tp.Rank = offset + len(out) + 1
 		tp.Quantity, tp.Revenue = decimal.RequireFromString(qty).String(), rev.String()
 		out = append(out, tp)
 	}
-	return out, rows.Err()
+	return out, int(total), rows.Err()
 }

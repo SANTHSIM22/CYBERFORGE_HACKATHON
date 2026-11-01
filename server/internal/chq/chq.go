@@ -26,7 +26,8 @@ type Params struct {
 	From, To   time.Time
 	Currency   string // optional for status rows; required for trends/top
 	Grain      string // hour | day
-	Limit      int
+	Limit      int    // top products: page size
+	Offset     int    // top products: products ranked before this page
 	Timeout    time.Duration
 }
 

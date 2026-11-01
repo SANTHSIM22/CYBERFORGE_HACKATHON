@@ -1,0 +1,15 @@
+# Several API copies behind nginx, which sends every request for one store to
+# the same copy:
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --scale api=3
+# Back to one copy:
+#   docker compose up -d --scale api=1 api
+# Copies cannot share the API's host port, so it is dropped here: use the
+# API through the dashboard's address (http://localhost:8088/api/...).
+# Each copy loads a store's in-memory view on its first read instead of all
+# stores at start. Services inside Docker that call http://api:8080 directly
+# (demo, tpctl, k6) are spread across copies by Docker's DNS, not by store.
+services:
+  api:
+    ports: !reset []
+    environment:
+      API_VIEW_PREWARM: "0"

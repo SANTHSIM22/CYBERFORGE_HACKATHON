@@ -2,10 +2,11 @@
 // bearer tokens naming a subject. A real OIDC/JWT adapter replaces Verify
 // without touching handlers, which only see an Identity.
 //
-// Subjects:
+// Subjects, one per role:
 //
-//	tenant:<slug>  member of exactly one tenant
-//	operator       may read every tenant and the /monitor stats
+//	tenant:<slug>  store owner: reads exactly one store
+//	org:<slug>     org admin: reads the org's consolidated dashboard and every store in the org
+//	operator       superuser: reads every org and store, and the /monitor stats
 package auth
 
 import (
@@ -18,13 +19,31 @@ import (
 
 type Identity struct {
 	Subject    string
-	TenantSlug string // set for tenant identities
-	Operator   bool
+	TenantSlug string // store owner
+	OrgSlug    string // org admin
+	Operator   bool   // superuser
 }
 
-// CanRead reports whether the identity is a member of the tenant.
-func (id Identity) CanRead(slug string) bool {
-	return id.Operator || (id.TenantSlug != "" && id.TenantSlug == slug)
+// Role names the identity's access level.
+func (id Identity) Role() string {
+	switch {
+	case id.Operator:
+		return "superuser"
+	case id.OrgSlug != "":
+		return "org_admin"
+	}
+	return "store_owner"
+}
+
+// CanRead reports whether the identity may read a store; orgSlug is the org
+// the store belongs to ("" for none).
+func (id Identity) CanRead(slug, orgSlug string) bool {
+	return id.Operator || (id.TenantSlug != "" && id.TenantSlug == slug) || (id.OrgSlug != "" && id.OrgSlug == orgSlug)
+}
+
+// CanReadOrg reports whether the identity may read an org's consolidated data.
+func (id Identity) CanReadOrg(orgSlug string) bool {
+	return id.Operator || (id.OrgSlug != "" && id.OrgSlug == orgSlug)
 }
 
 type Signer struct{ key []byte }
@@ -73,6 +92,8 @@ func ParseSubject(sub string) (Identity, error) {
 		return Identity{Subject: sub, Operator: true}, nil
 	case strings.HasPrefix(sub, "tenant:") && len(sub) > len("tenant:"):
 		return Identity{Subject: sub, TenantSlug: sub[len("tenant:"):]}, nil
+	case strings.HasPrefix(sub, "org:") && len(sub) > len("org:"):
+		return Identity{Subject: sub, OrgSlug: sub[len("org:"):]}, nil
 	}
 	return Identity{}, ErrInvalidToken
 }

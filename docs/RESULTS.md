@@ -138,8 +138,11 @@ Every other row ran the same query path at both sizes.
 ## Read-side changes (2026-11-01, 10M data, 100 stores)
 
 Three changes to the read side, measured on the same 10M data. Nothing in the
-ingester or the ClickHouse schema changed. `tpctl verify` after the query
-change: **6,932 / 6,932 checks exact**.
+ingester changed; the ClickHouse schema only gained read grants for the org
+dashboards. `tpctl verify` after all of them
+(including the org dashboards below): **8,634 / 8,634 store checks** (now also
+top-product ranks 11–20 and product counts) **and 90 / 90 org checks** (each
+org vs plain SQL on its 10 stores, 3 viewer timezones × 3 ranges), all exact.
 
 ### 1. ClickHouse fallback: one read per table
 

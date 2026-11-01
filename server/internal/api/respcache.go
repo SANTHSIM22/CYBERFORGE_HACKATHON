@@ -33,10 +33,16 @@ type RespCache struct {
 	asOf     map[string]time.Time // tenantID:generation -> source state fully reflected up to
 	status   map[string]chq.Status
 
-	umu    sync.Mutex
-	subs   map[string]chan struct{} // tenantID:generation -> closed when that store's data, snapshot state or health changes
-	health map[string]string        // tenantID:generation -> pipeline health at the last poll
-	now    func() time.Time
+	umu     sync.Mutex
+	subs    map[string]chan struct{} // tenantID:generation -> closed when that store's data, snapshot state or health changes
+	anySubs map[*anySub]struct{}     // org streams: closed when any of their stores changes
+	health  map[string]string        // tenantID:generation -> pipeline health at the last poll
+	now     func() time.Time
+}
+
+type anySub struct {
+	keys map[string]bool
+	ch   chan struct{}
 }
 
 // pipelineHealth is a store's pipeline state from its status row:
@@ -60,6 +66,28 @@ func pipelineHealth(st chq.Status, now time.Time) string {
 	return "live"
 }
 
+// freshBounds are the steps a live store's freshness is reported in: its data
+// is within this many milliseconds of the store's own database. Steps, not
+// the exact age, so a healthy store (re-confirmed about every second) stays
+// on one step and its dashboards get no events until something changes.
+var freshBounds = []int64{2_000, 5_000, 10_000, 30_000}
+
+// freshBound is the smallest step the store's data age fits in (0 when it is
+// not known or beyond the last step).
+func freshBound(st chq.Status, now time.Time) int64 {
+	at := st.DataAsOf()
+	if at == nil {
+		return 0
+	}
+	age := now.Sub(*at).Milliseconds()
+	for _, b := range freshBounds {
+		if age <= b {
+			return b
+		}
+	}
+	return 0
+}
+
 // answer is a response body and the path that computed it: "view" (the
 // in-memory rollups) or "clickhouse". It is reported as meta.source, also on
 // cache hits.
@@ -76,8 +104,28 @@ type cacheEntry struct {
 
 func NewRespCache(maxItems int, ttl, stale time.Duration) *RespCache {
 	return &RespCache{entries: map[string]cacheEntry{}, maxItems: maxItems, ttl: ttl, stale: stale, versions: map[string]uint64{}, asOf: map[string]time.Time{},
-		subs: map[string]chan struct{}{}, now: time.Now}
+		subs: map[string]chan struct{}{}, anySubs: map[*anySub]struct{}{}, now: time.Now}
 }
+
+// ChangedAny is Changed for a set of stores (an org's): the channel closes
+// when any of them changes. Call cancel once no longer waiting on it.
+func (c *RespCache) ChangedAny(keys []string) (ch <-chan struct{}, cancel func()) {
+	s := &anySub{keys: make(map[string]bool, len(keys)), ch: make(chan struct{})}
+	for _, k := range keys {
+		s.keys[k] = true
+	}
+	c.umu.Lock()
+	c.anySubs[s] = struct{}{}
+	c.umu.Unlock()
+	return s.ch, func() {
+		c.umu.Lock()
+		delete(c.anySubs, s)
+		c.umu.Unlock()
+	}
+}
+
+// StoreKey is how the cache names a store's data: tenantID:generation.
+func StoreKey(tenantID string, gen int64) string { return tenantID + ":" + strconv.FormatInt(gen, 10) }
 
 // Changed returns a channel that is closed when a version poll sees the
 // store's data version, snapshot state or pipeline health change, so a
@@ -109,19 +157,38 @@ func (c *RespCache) publish(versions map[string]uint64, asOf map[string]time.Tim
 	}
 	cur := c.status
 	c.vmu.Unlock()
-	health := make(map[string]string, len(cur))
+	health := make(map[string]string, len(cur)) // health and freshness step: a change in either wakes streams
 	for k, st := range cur {
-		health[k] = pipelineHealth(st, now)
+		health[k] = pipelineHealth(st, now) + "/" + strconv.FormatInt(freshBound(st, now), 10)
 	}
 	c.umu.Lock()
 	defer c.umu.Unlock()
 	prev := c.health
 	c.health = health
+	changed := map[string]bool{}
+	for k, n := range cur {
+		if o := old[k]; o.Found != n.Found || o.DataVersion != n.DataVersion || o.SnapshotState != n.SnapshotState || prev[k] != health[k] {
+			changed[k] = true
+		}
+	}
+	for k := range old {
+		if _, ok := cur[k]; !ok {
+			changed[k] = true
+		}
+	}
 	for k, ch := range c.subs {
-		o, n := old[k], cur[k]
-		if o.Found != n.Found || o.DataVersion != n.DataVersion || o.SnapshotState != n.SnapshotState || prev[k] != health[k] {
+		if changed[k] {
 			close(ch)
 			delete(c.subs, k)
+		}
+	}
+	for s := range c.anySubs {
+		for k := range s.keys {
+			if changed[k] {
+				close(s.ch)
+				delete(c.anySubs, s)
+				break
+			}
 		}
 	}
 }
@@ -189,6 +256,32 @@ func (c *RespCache) Put(key string, version uint64, a answer) {
 		return // a slower, older computation never replaces a newer answer
 	}
 	c.entries[key] = cacheEntry{a, version, time.Now()}
+}
+
+// SweepExpired drops, every `every`, answers older than the TTL (they can
+// never be served again), so cache memory follows recent traffic instead of
+// waiting for the item cap.
+func (c *RespCache) SweepExpired(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			c.sweep(now)
+		}
+	}
+}
+
+func (c *RespCache) sweep(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, e := range c.entries {
+		if now.Sub(e.at) > c.ttl {
+			delete(c.entries, k)
+		}
+	}
 }
 
 // Status returns the tenant's freshness row from the last poll, so

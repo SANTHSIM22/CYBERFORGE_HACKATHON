@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"tenantpulse/internal/chq"
+	"tenantpulse/internal/registry"
 )
 
 func TestRespCacheStaleWhileRevalidate(t *testing.T) {
@@ -221,6 +222,52 @@ func TestRespCacheWakesOnHealthChange(t *testing.T) {
 	}
 	if h := pipelineHealth(st, now); h != "stalled" {
 		t.Fatalf("health=%s, want stalled", h)
+	}
+}
+
+// Views nobody reads are dropped; a view being read, or still loading, stays.
+func TestViewsEvictedWhenIdle(t *testing.T) {
+	b := &ViewBackend{Idle: 15 * time.Minute}
+	stale := &registry.Tenant{ID: "a", ActiveGeneration: 1, Timezone: "UTC"}
+	read := &registry.Tenant{ID: "b", ActiveGeneration: 1, Timezone: "UTC"}
+	loading := &registry.Tenant{ID: "c", ActiveGeneration: 1, Timezone: "UTC"}
+	for _, tn := range []*registry.Tenant{stale, read, loading} {
+		b.get(tn)
+	}
+	old := time.Now().Add(-20 * time.Minute).UnixNano()
+	for _, id := range []string{"a", "c"} {
+		si, _ := b.views.Load(id)
+		si.(*viewSlot).used.Store(old)
+	}
+	si, _ := b.views.Load("c")
+	b.syncs.Store(si.(*viewSlot).view, &viewSync{done: make(chan struct{})})
+
+	if kept, dropped := b.evict(time.Now()); kept != 2 || dropped != 1 {
+		t.Fatalf("kept=%d dropped=%d, want 2 and 1", kept, dropped)
+	}
+	if _, ok := b.views.Load("a"); ok {
+		t.Fatal("an idle view must be dropped")
+	}
+	if v := b.get(stale); v == nil || v.Loaded() {
+		t.Fatal("a dropped view comes back empty on the next read and loads again")
+	}
+}
+
+func TestRespCacheSweepDropsExpired(t *testing.T) {
+	c := NewRespCache(100, time.Minute, 5*time.Second)
+	c.Put("old", 1, answer{body: []byte("x")})
+	c.Put("new", 1, answer{body: []byte("y")})
+	c.mu.Lock()
+	e := c.entries["old"]
+	e.at = time.Now().Add(-2 * time.Minute)
+	c.entries["old"] = e
+	c.mu.Unlock()
+	c.sweep(time.Now())
+	if _, _, _, ok := c.Get("old", 1, 0); ok {
+		t.Fatal("an expired answer must be swept")
+	}
+	if _, _, _, ok := c.Get("new", 1, 0); !ok {
+		t.Fatal("a fresh answer must stay")
 	}
 }
 

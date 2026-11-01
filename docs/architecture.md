@@ -110,7 +110,7 @@ flowchart LR
 | Source | More source clusters; new tenants are placed by capacity (`source_clusters`) |
 | Ingester | `INGESTER_COUNT=N`; tenants are hash-partitioned, so each slot has one reader. Restarting or moving an ingester is safe (slot + idempotent rows) |
 | ClickHouse | `ReplicatedReplacingMergeTree` + `Distributed` sharded by `cityHash64(tenant_id)`: one tenant's rows live on one shard, so `FINAL` stays local. Replicas per shard (ClickHouse Keeper) |
-| API | Stateless replicas behind a load balancer; per-tenant and global query limits (B-3) |
+| API | Stateless replicas behind nginx, which routes each tenant to one replica (hash of the tenant in the URL, `docker-compose.scale.yml`), so a tenant's cache and in-memory view are held once; views unread for 15 min are dropped; per-tenant and global query limits (B-3) |
 
 ## Isolation (FR-5)
 

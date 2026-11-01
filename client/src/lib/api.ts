@@ -131,10 +131,20 @@ export type Subject = {
   status: string;
   default_currency: string;
   timezone: string;
+  org?: string; // slug of the store's org, '' for none
 };
 
 export async function subjects(): Promise<Subject[]> {
+  return (await directory()).tenants;
+}
+
+// An org admin identity: one consolidated dashboard across the org's stores.
+export type OrgSubject = { subject: string; slug: string; name: string; reporting_currency: string; stores: number };
+
+// directory lists every identity the dev login can issue: store owners and org admins.
+export async function directory(): Promise<{ tenants: Subject[]; orgs: OrgSubject[] }> {
   const r = await fetch('/api/v1/dev/subjects');
   if (!r.ok) throw new ApiError(r.status, await safeJson(r));
-  return (await r.json()).tenants;
+  const d = await r.json();
+  return { tenants: d.tenants ?? [], orgs: d.orgs ?? [] };
 }

@@ -463,32 +463,32 @@ type topEntry struct {
 }
 
 // TopProducts mirrors chq.TopProducts for the preset windows, computed from
-// the product-day cells in memory; other ranges return ok=false.
-func (v *View) TopProducts(p Params) ([]TopProduct, bool) {
+// the product-day cells in memory: one page and the number of products that
+// sold. Other ranges return ok=false.
+func (v *View) TopProducts(p Params) ([]TopProduct, int, bool) {
 	now := time.Now()
 	w, ok := v.window(p, now)
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	tw := v.topFor(now)
 	if tw == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	ranked := tw.ranked[w][p.Currency]
 	out := []TopProduct{}
-	for _, e := range tw.ranked[w][p.Currency] {
-		if len(out) == p.Limit {
-			break
-		}
-		t := TopProduct{Rank: len(out) + 1, ProductID: v.pids[e.pid], Name: "(unknown product)",
+	for i := p.Offset; i < len(ranked) && len(out) < p.Limit; i++ {
+		e := ranked[i]
+		t := TopProduct{Rank: i + 1, ProductID: v.pids[e.pid], Name: "(unknown product)",
 			Quantity: decimal.New(e.q, -prodScale).String(), Revenue: decimal.New(e.rv, -prodScale).String()}
 		if n, ok := v.names[e.pid]; ok {
 			t.Name, t.SKU = n.name, n.sku
 		}
 		out = append(out, t)
 	}
-	return out, true
+	return out, len(ranked), true
 }
 
 // window returns the preset window index matching [p.From, p.To), if any.

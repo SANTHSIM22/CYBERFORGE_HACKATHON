@@ -83,6 +83,17 @@ func (s *Server) Router() *gin.Engine {
 	t.GET("/orders/trends", s.ready4(s.trends))
 	t.GET("/orders/breakdown", s.ready4(s.breakdown))
 	t.GET("/products/top", s.ready4(s.topProducts))
+
+	// Org dashboards: org admins of that org and superusers only.
+	authed.GET("/orgs", s.listOrgs)
+	o := authed.Group("/orgs/:org", s.authorizeOrg)
+	o.GET("", s.orgInfo)
+	o.GET("/freshness", s.orgFreshness)
+	o.GET("/stream", s.orgStream)
+	o.GET("/orders/summary", s.orgSummary)
+	o.GET("/orders/trends", s.orgTrends)
+	o.GET("/orders/breakdown", s.orgBreakdown)
+	o.GET("/products/top", s.orgTop)
 	return r
 }
 
@@ -130,7 +141,7 @@ func (s *Server) authorizeTenant(c *gin.Context) {
 		}
 		return
 	}
-	if !id.CanRead(t.Slug) {
+	if !id.CanRead(t.Slug, t.OrgSlug()) {
 		abort(c, 403, "forbidden", "identity "+id.Subject+" is not a member of this tenant")
 		return
 	}
@@ -159,13 +170,20 @@ func (s *Server) ready4(h gin.HandlerFunc) gin.HandlerFunc {
 	}
 }
 
+// devSubjects lists the identities the dev login can issue: a store owner per
+// store, an org admin per org, and the superuser.
 func (s *Server) devSubjects(c *gin.Context) {
-	out := []gin.H{}
-	for _, t := range s.Reg.Current().Ordered {
+	snap := s.Reg.Current()
+	out, orgs := []gin.H{}, []gin.H{}
+	for _, t := range snap.Ordered {
 		out = append(out, gin.H{"subject": "tenant:" + t.Slug, "slug": t.Slug, "name": t.Name, "tier": t.Tier,
-			"status": t.Status, "default_currency": t.DefaultCurrency, "timezone": t.Timezone})
+			"status": t.Status, "default_currency": t.DefaultCurrency, "timezone": t.Timezone, "org": t.OrgSlug()})
 	}
-	c.JSON(200, gin.H{"operator": "operator", "tenants": out})
+	for _, o := range snap.Orgs {
+		orgs = append(orgs, gin.H{"subject": "org:" + o.Slug, "slug": o.Slug, "name": o.Name,
+			"reporting_currency": o.ReportingCurrency, "stores": len(o.Stores)})
+	}
+	c.JSON(200, gin.H{"operator": "operator", "tenants": out, "orgs": orgs})
 }
 
 func (s *Server) devLogin(c *gin.Context) {
@@ -173,7 +191,7 @@ func (s *Server) devLogin(c *gin.Context) {
 		Subject string `json:"subject"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		abort(c, 400, "bad_request", `body must be {"subject": "tenant:<slug>" | "operator"}`)
+		abort(c, 400, "bad_request", `body must be {"subject": "tenant:<slug>" | "org:<slug>" | "operator"}`)
 		return
 	}
 	if _, err := auth.ParseSubject(body.Subject); err != nil {
@@ -187,7 +205,7 @@ func (s *Server) listTenants(c *gin.Context) {
 	id := c.MustGet("identity").(auth.Identity)
 	out := []gin.H{}
 	for _, t := range s.Reg.Current().Ordered {
-		if id.CanRead(t.Slug) {
+		if id.CanRead(t.Slug, t.OrgSlug()) {
 			out = append(out, gin.H{"slug": t.Slug, "name": t.Name, "tier": t.Tier, "status": t.Status,
 				"timezone": t.Timezone, "default_currency": t.DefaultCurrency})
 		}
@@ -341,7 +359,7 @@ func abort(c *gin.Context, code int, kind, detail string) {
 }
 
 func (s *Server) params(c *gin.Context, t *registry.Tenant) (chq.Params, bool) {
-	from, to, err := parseRange(c, t, time.Now())
+	from, to, err := parseRange(c, t.Loc, time.Now())
 	if err != nil {
 		abort(c, 400, "bad_request", err.Error())
 		return chq.Params{}, false
@@ -515,24 +533,33 @@ func (s *Server) topProducts(c *gin.Context) {
 		abort(c, 400, "bad_request", err.Error())
 		return
 	}
-	limit, err := parseLimit(c)
+	limit, offset, err := parsePage(c)
 	if err != nil {
 		abort(c, 400, "bad_request", err.Error())
 		return
 	}
-	p.Currency, p.Limit = cur, limit
-	s.serve(c, "top", normalized{Route: "top", From: p.From.UnixMilli(), To: p.To.UnixMilli(), Currency: cur, Limit: limit, TZ: t.Timezone},
+	p.Currency, p.Limit, p.Offset = cur, limit, offset
+	s.serve(c, "top", normalized{Route: "top", From: p.From.UnixMilli(), To: p.To.UnixMilli(), Currency: cur, Limit: limit, Offset: offset, TZ: t.Timezone},
 		func(ctx context.Context) (any, error) {
-			rows, err := s.B.Top(ctx, t, p)
+			rows, total, err := s.B.Top(ctx, t, p)
 			if err != nil {
 				return nil, err
 			}
 			if rows == nil {
 				rows = []chq.TopProduct{}
 			}
-			return gin.H{"from": p.From, "to": p.To, "timezone": t.Timezone, "currency": cur, "limit": limit,
-				"metric": "recognized line revenue (quantity x unit_price)", "products": rows, "as_of": s.asOf(ctx, t)}, nil
+			return gin.H{"from": p.From, "to": p.To, "timezone": t.Timezone, "currency": cur,
+				"metric": "recognized line revenue (quantity x unit_price)", "products": rows, "as_of": s.asOf(ctx, t),
+				"limit": limit, "offset": offset, "total": total, "next_offset": nextOffset(offset, len(rows), total)}, nil
 		})
+}
+
+// nextOffset is the offset of the following page, or nil on the last one.
+func nextOffset(offset, n, total int) *int {
+	if next := offset + n; n > 0 && next < total {
+		return &next
+	}
+	return nil
 }
 
 func (s *Server) tenantInfo(c *gin.Context) {
@@ -591,15 +618,16 @@ func (s *Server) freshnessBody(t *registry.Tenant, st chq.Status, start time.Tim
 		status = t.Status
 	}
 	version := strconv.FormatUint(s.Cache.Version(t.ID, t.ActiveGeneration), 10)
+	bound := freshBound(st, now) // live data is within this many ms of the store (0: beyond 30 s or unknown)
 	return gin.H{
-		"tenant": t.Slug, "generation": t.ActiveGeneration, "status": status, "tenant_status": t.Status,
-		"snapshot_state": st.SnapshotState, "data_as_of": asOf, "data_age_ms": age(asOf),
+		"scope": "tenant:" + t.Slug, "tenant": t.Slug, "generation": t.ActiveGeneration, "status": status, "tenant_status": t.Status,
+		"snapshot_state": st.SnapshotState, "data_as_of": asOf, "data_age_ms": age(asOf), "fresh_within_ms": bound,
 		"last_source_commit_at": st.LastSourceCommitAt, "last_applied_at": st.LastAppliedAt, "processing_lag_ms": st.LastApplyLagMs,
 		"last_heartbeat_source_at": st.LastHeartbeatSourceAt, "stream_checked_at": st.StreamCheckedAt,
 		"slot_lag_bytes": st.SlotLagBytes, "events_applied_total": st.EventsTotal,
 		"data_version": version,
 		"server_time":  now.UTC(), "took_ms": float64(time.Since(start).Microseconds()) / 1000,
-	}, fmt.Sprintf("%d|%s|%s|%s", t.ActiveGeneration, status, st.SnapshotState, version)
+	}, fmt.Sprintf("%d|%s|%s|%s|%d", t.ActiveGeneration, status, st.SnapshotState, version, bound)
 }
 
 func nilIfEmpty(s string) *string {

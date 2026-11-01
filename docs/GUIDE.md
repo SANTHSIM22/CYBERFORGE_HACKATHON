@@ -189,14 +189,15 @@ sequenceDiagram
 7. **The API notices** the new version on its next 250 ms poll.
 8. **The dashboard is told.** Each open dashboard holds one streamed response
    (`/stream`, Server-Sent Events). The API pushes an event on it right after
-   the poll that saw the new version, and otherwise only when the pipeline's
-   health changes (live, lagging, stalled). With no changes nothing is sent
-   but an invisible keepalive comment every 20 s. The dashboard reloads its
-   four widgets and asks for "at least this version" so it can never show
-   data older than its freshness badge. The badge reads "Live · last change
-   4m ago": the time since the store's last real change, counted in the
-   browser. If the stream cannot be opened (a proxy that blocks streaming,
-   for example), the page polls `/freshness` every second instead.
+   the poll that saw the new version, and otherwise only when the data's
+   freshness changes step (within 2, 5, 10 or 30 s of the store) or the
+   pipeline falls behind. With no changes nothing is sent but an invisible
+   keepalive comment every 20 s. The dashboard reloads its four widgets and
+   asks for "at least this version" so it can never show data older than its
+   freshness badge. The badge reads "Fresh · within 2 s of the store", or
+   "Behind · data from 45s ago" (counting up in the browser) while the
+   pipeline catches up. If the stream cannot be opened (a proxy that blocks
+   streaming, for example), the page polls `/freshness` every second instead.
 9. **The API answers from memory.** Its in-memory view of the store reads only
    the rollup cells written since its last sync (a few rows) and computes the
    answer in microseconds.
@@ -286,10 +287,10 @@ tiny delta read per store per change".
 | **A 15-minute base level** under hours and days | Raw rows are re-read only for the quarter-hours that changed; everything above is summed from small cells. Our first version rebuilt each store's whole "today" from raw rows after every batch: at 100 stores writing hard, that read ~8 million rows a second and stalled ingestion | One more internal table per rollup family |
 | **Recompute cells, never add deltas** | Replays after a crash cannot double count | Each refresh re-reads the touched quarter-hours (bounded) instead of applying +/- |
 | **De-duplicate order lines with `argMax`, not `FINAL`** | ClickHouse's `FINAL` widens a read back to whole key ranges, undoing index skipping: 103 lines cost 6.2 million rows read | Slightly longer SQL |
-| **No Redis** | The API's own memory answers in microseconds, with no extra service and no invalidation races; the judges asked for no Redis | Each API copy keeps its own cache and views |
+| **No Redis** | The API's own memory answers in microseconds, with no extra service and no invalidation races; the judges asked for no Redis. nginx routes each store to one API copy, so its data is held once, like a sharded cache | A copy that restarts refills its stores from ClickHouse |
 | **Data versions** instead of time-based expiry | A cached answer is tied to the exact data it came from, so it is never silently wrong | One tiny status query every 250 ms per API copy |
 | **Stale-while-revalidate (5 s)** | When data changes, readers get the previous answer instantly while one background query refreshes it, instead of everyone waiting on ClickHouse at once | Data shown can be up to 5 s behind (the target is < 30 s); dashboards that already know a newer version wait for it |
-| **In-memory views** | ClickHouse work follows data changes, not viewers × widgets × ranges | Memory: about 0.5 MB for the largest store; anything unusual falls back to ClickHouse |
+| **In-memory views** | ClickHouse work follows data changes, not viewers × widgets × ranges | Memory: about 0.5 MB for the largest store, held only while someone reads the store (dropped after 15 minutes unread) and only on the copy that store is routed to; anything unusual falls back to ClickHouse |
 | **Freshness pushed, not polled** | One query every 250 ms tells the API every store's data version and pipeline health; each open dashboard holds one stream and gets an event only when its store's data or health changes. Polling cost one HTTP request per viewer per second | Each stream holds a connection; nginx allows 8,192 per worker. CPU for 2,000 open dashboards is measured in [RESULTS.md](RESULTS.md); nothing reaches ClickHouse either way |
 | **Exported snapshot for new stores** | The first full copy and the live stream start at exactly the same point: no gap, no duplicate | Interrupted snapshots are redone from scratch |
 | **Database per store** | Strong isolation, simple per-store backup and moves | More databases to manage (automated by the control plane) |
@@ -338,8 +339,44 @@ Four independent walls; any one of them alone would stop a cross-store read.
    query must carry the store id as a setting, and ClickHouse itself filters
    to that store. A query without it fails (fail closed). The monitoring user
    sees pipeline health only, never orders or products.
-4. **API:** the token's identity must belong to the store in the URL, otherwise 403.
+4. **API:** the token's identity must be allowed the store in the URL, otherwise 403.
    The dashboard's "Try cross-tenant read" button demonstrates this.
+
+### Roles and org dashboards
+
+Every token carries one role:
+
+| Role (token subject) | Store dashboards | Org dashboard | Monitor |
+|---|---|---|---|
+| Store owner (`tenant:<store>`) | that store | — | — |
+| Org admin (`org:<org>`) | every store in the org | that org | — |
+| Superuser (`operator`) | all | all | yes |
+
+An **org** groups stores under one owner (control-plane table `orgs`; each
+store belongs to at most one). Its dashboard adds up the org's stores:
+
+- **Each store's slice is read on its own**, under that store's own
+  row-policy setting, exactly as its own dashboard is, then added up in the
+  API. The four walls above are unchanged; an org read is a set of store reads.
+- **Days follow the viewer's clock** (`tz=` from the browser). Every timezone
+  offset is a multiple of 15 minutes, so any local day is a whole set of the
+  15-minute cells, and org totals stay exact for whatever timezone the
+  viewer and the stores are in.
+- **Money is added per currency, exactly, then converted** into the org's
+  reporting currency at fixed rates (`fx_rates`, set with `tpctl fx set`).
+  Converted totals are approximate and labelled so; the exact per-currency
+  amounts are shown next to them. A currency without a rate is left out of
+  converted totals and listed, never guessed.
+- **Top N across stores is exact:** a product in the org's first N has fewer
+  than N products above it in its own store, so each store's first N (by the
+  same converted revenue) contains it.
+- `tpctl verify` checks every org: in three viewer timezones and three
+  presets, the org's exact per-currency totals must equal plain SQL on each
+  member store's database, added up.
+
+The dev login issues any role without a password (`AUTH_MODE=dev`); a real
+identity provider (OIDC/JWT) replaces `auth.Verify` without touching the
+handlers, which only see a role.
 
 **Personal data:** the change stream's column list excludes `customer_id`, so
 customer identity never leaves the store database. ClickHouse holds orders,
@@ -430,7 +467,7 @@ change, not once per viewer, widget or range.
 | Store databases | More database servers; new stores are placed by capacity |
 | Ingester | `INGESTER_COUNT=N`: stores are split across ingesters by hash; each replication slot has exactly one reader; restarts and moves are safe |
 | ClickHouse | Shards by store id (one store's rows live on one shard, so queries stay local) plus replicas |
-| API | Stateless copies behind a load balancer; each keeps its own cache and views |
+| API | Stateless copies behind nginx, which routes each store to one copy (`docker-compose.scale.yml`); a store's cache and view live only on its copy |
 
 ### Known limits and next optimizations
 
@@ -445,9 +482,16 @@ Honest list of what would need work beyond this project's scale:
    since Postgres 16): the primary then ships its log once and does no
    decoding work. Alternatively, cap stores per server; the control plane
    already places stores on source clusters by capacity.
-2. **Many API copies.** Each copy keeps its own cache and views, so N copies
-   ask ClickHouse N times per change. Fine for a handful of copies; beyond
-   that, put a shared change feed in front or route each store to one copy.
+2. **Many API copies.** Addressed: nginx routes every request for a store to
+   one copy (a hash of the store in the URL), so each store's view
+   and cache live in exactly one copy and ClickHouse is asked once per change.
+   Views unread for 15 minutes are dropped (`API_VIEW_IDLE`), so memory follows
+   the stores being watched. What remains: every copy still polls all stores'
+   versions (one small query each, every 250 ms); services that call the API
+   directly inside Docker (demo, `tpctl`, k6) are not routed by store; and the
+   hash is not consistent (nginx 1.29 fell back to round robin with
+   `consistent`), so adding or removing a copy moves most stores, whose views
+   then load once on their new copy.
 3. **Very busy single stores.** A refresh re-reads the touched quarter-hour of
    raw rows, so a single store taking hundreds of orders per second re-reads up
    to 15 minutes of its own orders each second. Bounded, but finer base cells
@@ -593,6 +637,8 @@ Useful settings (`.env`): `INGEST_FLUSH_INTERVAL` (batching, default 1 s),
 `INGEST_VERSION_EVERY` (how often a store's data version may change, 1 s),
 `API_CACHE_STALE` (5 s), `API_VIEWS` (in-memory views on/off),
 `API_STREAM_KEEPALIVE` (keepalive comment on an idle freshness stream, 20 s),
+`API_VIEW_IDLE` (drop a store's in-memory view after this long unread, 15 min),
+`API_VIEW_PREWARM` (load every store's view at start, 0 = only on first read),
 `API_TENANT_CONCURRENCY` and `API_DB_CONCURRENCY` (query limits),
 `API_LIMIT_WAIT` (1 s), `DEMO_MODE`.
 

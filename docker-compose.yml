@@ -167,7 +167,8 @@ services:
       timeout: 3s
       retries: 10
 
-  # Stateless: scale horizontally behind the web proxy.
+  # Stateless: scale horizontally behind the web proxy, which routes each store
+  # to one copy (docker-compose.scale.yml).
   api:
     <<: *go
     command: ["api"]
@@ -177,6 +178,8 @@ services:
       # Freshness streams send events only when a store's data or pipeline health
       # changes; an idle stream gets a keepalive comment this often (under nginx's 30 s timeout).
       API_STREAM_KEEPALIVE: ${API_STREAM_KEEPALIVE:-20s}
+      # A store's in-memory view is dropped after this long without a read.
+      API_VIEW_IDLE: ${API_VIEW_IDLE:-15m}
       API_TENANT_CONCURRENCY: ${API_TENANT_CONCURRENCY:-16}
       API_DB_CONCURRENCY: ${API_DB_CONCURRENCY:-64}
     ports:

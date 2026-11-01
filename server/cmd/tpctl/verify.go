@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/shopspring/decimal"
 
 	"tenantpulse/internal/chq"
 	"tenantpulse/internal/config"
@@ -61,10 +62,144 @@ func verifyCmd(ctx context.Context, e *env, args []string) error {
 		}
 	}
 	fmt.Printf("\n%d tenants, %d checks, %d tenants with mismatches (%s)\n", len(ts), totalChecks, failed, time.Since(start).Round(time.Millisecond))
+	if slug == "" && limit == 0 {
+		orgs, checks, bad, err := verifyOrgs(ctx, e)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%d orgs, %d checks, %d orgs with mismatches\n", orgs, checks, bad)
+		failed += bad
+	}
 	if failed > 0 {
 		return fmt.Errorf("reconciliation found mismatches")
 	}
 	return nil
+}
+
+// verifyOrgs checks every org dashboard's exact numbers: for three viewer
+// timezones and three presets, the org's per-currency totals (added up from
+// each store's 15-minute cells, as the API does) must equal plain SQL on each
+// member store's own database, added up.
+func verifyOrgs(ctx context.Context, e *env) (orgs, checks, failed int, err error) {
+	rows, err := e.control.Query(ctx, `
+		SELECT o.org_slug, t.tenant_id::text, t.tenant_slug, t.timezone, t.default_currency, t.source_database, c.endpoint_secret_ref, t.active_generation
+		FROM tenants t JOIN orgs o USING (org_id) JOIN source_clusters c USING (source_cluster_id)
+		WHERE t.status = 'active' ORDER BY o.org_slug, t.tenant_slug`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	members := map[string][]vTenant{}
+	var order []string
+	for rows.Next() {
+		var org string
+		var t vTenant
+		if err := rows.Scan(&org, &t.id, &t.slug, &t.tz, &t.cur, &t.db, &t.ref, &t.gen); err != nil {
+			rows.Close()
+			return 0, 0, 0, err
+		}
+		if _, ok := members[org]; !ok {
+			order = append(order, org)
+		}
+		members[org] = append(members[org], t)
+	}
+	rows.Close()
+	for _, org := range order {
+		var n int
+		var diffs []string
+		for attempt := 1; attempt <= 3; attempt++ { // retry only if writes landed between the two reads
+			if n, diffs, err = compareOrg(ctx, e, members[org]); err != nil || len(diffs) == 0 {
+				break
+			}
+		}
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("org %s: %w", org, err)
+		}
+		orgs++
+		checks += n
+		if len(diffs) == 0 {
+			fmt.Printf("✓ org %-14s %3d/%d checks match direct SQL on its %d stores exactly\n", org, n, n, len(members[org]))
+			continue
+		}
+		failed++
+		fmt.Printf("✗ org %-14s %d mismatches\n", org, len(diffs))
+		for i, d := range diffs {
+			if i == 8 {
+				fmt.Printf("    ... %d more\n", len(diffs)-8)
+				break
+			}
+			fmt.Println("    " + d)
+		}
+	}
+	return orgs, checks, failed, nil
+}
+
+type exactTotals struct {
+	orders     int64
+	gross, rec decimal.Decimal
+}
+
+func compareOrg(ctx context.Context, e *env, ts []vTenant) (int, []string, error) {
+	srcs := make([]*pgx.Conn, 0, len(ts))
+	defer func() {
+		for _, c := range srcs {
+			c.Close(context.Background())
+		}
+	}()
+	for _, t := range ts {
+		src, err := sourceConn(ctx, t)
+		if err != nil {
+			return 0, nil, err
+		}
+		srcs = append(srcs, src)
+		if err := watermark(ctx, e, src, t.id, t.gen); err != nil {
+			return 0, nil, err
+		}
+	}
+	checks := 0
+	var diffs []string
+	for _, tz := range []string{"UTC", "Asia/Kolkata", "America/New_York"} {
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
+			return 0, nil, err
+		}
+		for _, days := range []int{1, 7, 30} {
+			r := domain.PresetRange(time.Now(), days, loc)
+			got, want := map[string]exactTotals{}, map[string]exactTotals{}
+			for i, t := range ts {
+				cells, err := chq.OrgOrders(ctx, e.chAPI, chq.Params{TenantID: t.id, Generation: t.gen, TZ: tz,
+					From: r.From.UTC(), To: r.To.UTC(), Timeout: 30 * time.Second}, "", time.Time{})
+				if err != nil {
+					return 0, nil, err
+				}
+				for _, c := range cells {
+					g := got[c.Currency]
+					got[c.Currency] = exactTotals{g.orders + c.Orders, g.gross.Add(c.Gross), g.rec.Add(c.Recognized)}
+				}
+				cur, _, err := directsql.Summary(ctx, srcs[i], r.From.Add(-r.To.Sub(r.From)), r.From, r.To)
+				if err != nil {
+					return 0, nil, err
+				}
+				for _, c := range cur {
+					w := want[c.Currency]
+					want[c.Currency] = exactTotals{w.orders + c.Orders, w.gross.Add(decimal.RequireFromString(c.GrossSales)),
+						w.rec.Add(decimal.RequireFromString(c.RecognizedSales))}
+				}
+			}
+			checks++
+			label := fmt.Sprintf("viewer in %s, %dd", tz, days)
+			for c, w := range want {
+				if g := got[c]; g.orders != w.orders || !g.gross.Equal(w.gross) || !g.rec.Equal(w.rec) {
+					diffs = append(diffs, fmt.Sprintf("%s %s: got %d / %s / %s, want %d / %s / %s", label, c, g.orders, g.gross, g.rec, w.orders, w.gross, w.rec))
+				}
+			}
+			for c := range got {
+				if _, ok := want[c]; !ok {
+					diffs = append(diffs, fmt.Sprintf("%s %s: in the org total but not in the stores", label, c))
+				}
+			}
+		}
+	}
+	return checks, diffs, nil
 }
 
 func activeTenants(ctx context.Context, e *env, slug string) ([]vTenant, error) {
@@ -231,21 +366,38 @@ func compareAll(ctx context.Context, e *env, src *pgx.Conn, t vTenant, gen int64
 			}
 		}
 		for _, c := range currencies {
-			pc := p
-			pc.Currency = c
-			gotP, err := chq.TopProducts(ctx, e.chAPI, pc)
-			if err != nil {
-				return 0, nil, err
-			}
-			wantP, err := directsql.TopProducts(ctx, tx, r.From, r.To, c, 10)
-			if err != nil {
-				return 0, nil, err
-			}
-			add(label+" top10 "+c, chq.DiffTop(gotP, wantP))
-			if top, ok := view.TopProducts(pc); ok {
-				add(label+" view top10 "+c, chq.DiffTop(top, wantP))
+			for _, offset := range []int{0, 10} { // first page and the next: ranks 1-10, 11-20
+				pc := p
+				pc.Currency, pc.Offset = c, offset
+				page := fmt.Sprintf(" top products %d-%d %s", offset+1, offset+pc.Limit, c)
+				gotP, gotN, err := chq.TopProducts(ctx, e.chAPI, pc)
+				if err != nil {
+					return 0, nil, err
+				}
+				wantP, wantN, err := directsql.TopProducts(ctx, tx, r.From, r.To, c, pc.Limit, offset)
+				if err != nil {
+					return 0, nil, err
+				}
+				if len(wantP) == 0 && gotN == 0 {
+					wantN = 0 // past the last page: no row carries the total
+				}
+				add(label+page, append(chq.DiffTop(gotP, wantP), diffCount(gotN, wantN)...))
+				if top, n, ok := view.TopProducts(pc); ok {
+					if len(wantP) == 0 {
+						n = wantN // the view knows the total even past the last page
+					}
+					add(label+" view"+page, append(chq.DiffTop(top, wantP), diffCount(n, wantN)...))
+				}
 			}
 		}
 	}
 	return checks, diffs, nil
+}
+
+// diffCount compares the number of products that sold in a range.
+func diffCount(got, want int) []string {
+	if got == want {
+		return nil
+	}
+	return []string{fmt.Sprintf("products that sold: got %d, want %d", got, want)}
 }

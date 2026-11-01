@@ -291,8 +291,10 @@ func splitMonths(d domain.DayRange) []daySegment {
 }
 
 // TopProducts ranks products by recognized line revenue: whole days from the
-// product day rollup, partial days from raw items of recognized orders.
-func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct, error) {
+// product day rollup, partial days from raw items of recognized orders. It
+// returns one page (ranks p.Offset+1 .. p.Offset+p.Limit) and how many
+// products sold in the range.
+func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct, int, error) {
 	q := newQB(p)
 	plan := domain.Decompose(p.From, p.To, location(p.TZ), true)
 	c := q.arg("String", p.Currency)
@@ -343,28 +345,29 @@ func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct,
 		) WHERE deleted = 0`)
 	}
 	if len(parts) == 0 {
-		return []TopProduct{}, nil
+		return []TopProduct{}, 0, nil
 	}
-	limit := q.arg("UInt32", strconv.Itoa(p.Limit))
+	limit, offset := q.arg("UInt32", strconv.Itoa(p.Limit)), q.arg("UInt32", strconv.Itoa(p.Offset))
 	rows, err := conn.Query(p.qctx(ctx, q), `
-		SELECT toString(product_id) AS pid, toString(sum(qty)), toString(sum(rv)), sum(rv) AS revenue
+		SELECT toString(product_id) AS pid, toString(sum(qty)), toString(sum(rv)), sum(rv) AS revenue, count() OVER () AS total
 		FROM (`+strings.Join(parts, "\nUNION ALL\n")+`)
 		GROUP BY pid HAVING sum(qty) != 0 OR sum(rv) != 0
-		ORDER BY revenue DESC, pid LIMIT `+limit)
+		ORDER BY revenue DESC, pid LIMIT `+limit+` OFFSET `+offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var out []TopProduct
 	var ids []string
+	var total uint64
 	for rows.Next() {
 		var t TopProduct
 		var qty, rv string
 		var rvd decimal.Decimal
-		if err := rows.Scan(&t.ProductID, &qty, &rv, &rvd); err != nil {
+		if err := rows.Scan(&t.ProductID, &qty, &rv, &rvd, &total); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, 0, err
 		}
-		t.Rank = len(out) + 1
+		t.Rank = p.Offset + len(out) + 1
 		t.Quantity, t.Revenue = decimal.RequireFromString(qty).String(), decimal.RequireFromString(rv).String()
 		t.Name = "(unknown product)"
 		out = append(out, t)
@@ -372,7 +375,7 @@ func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct,
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil || len(out) == 0 {
-		return out, err
+		return out, int(total), err
 	}
 	nq := newQB(p)
 	nq.params["ids"] = "[" + strings.Join(ids, ",") + "]"
@@ -380,7 +383,7 @@ func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct,
 		SELECT toString(product_id), name, sku FROM tp.products FINAL
 		WHERE `+tenantWhere+` AND product_id IN {ids:Array(UUID)}`)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer names.Close()
 	byID := map[string]int{}
@@ -391,11 +394,11 @@ func TopProducts(ctx context.Context, conn driver.Conn, p Params) ([]TopProduct,
 		var id, name string
 		var sku *string
 		if err := names.Scan(&id, &name, &sku); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if i, ok := byID[id]; ok {
 			out[i].Name, out[i].SKU = name, sku
 		}
 	}
-	return out, names.Err()
+	return out, int(total), names.Err()
 }

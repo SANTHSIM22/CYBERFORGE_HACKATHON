@@ -33,6 +33,8 @@ const usage = `tpctl — TenantPulse operator CLI
   tenant add-batch --count N [--cdc ...]  add N new tenants (never removes any)
   tenant ensure --count N [--cdc ...]     add tenants until at least N exist (monotonic)
   tenant list | tenant status --slug S
+  org list | org add --slug S [--name --currency USD] | org assign --org S --stores a,b | org demo [--size 10]
+  fx list | fx set --currency INR --per-usd 88.25 [--as-of YYYY-MM-DD]
   migrate-source-all                      apply pending source migrations to every tenant DB (sequentially)
   capture pause-all|resume-all            pause/resume change capture (for OLTP impact runs)
   seed --tenants N --rows R [--days 365] [--workers 4]
@@ -104,6 +106,16 @@ func dispatch(ctx context.Context, cmd string, args []string) error {
 			return fmt.Errorf("tenant: missing subcommand")
 		}
 		return tenantCmd(ctx, e, args[0], args[1:])
+	case "org":
+		if len(args) == 0 {
+			return fmt.Errorf("org: missing subcommand")
+		}
+		return orgCmd(ctx, e, args[0], args[1:])
+	case "fx":
+		if len(args) == 0 {
+			return fmt.Errorf("fx: missing subcommand")
+		}
+		return fxCmd(ctx, e, args[0], args[1:])
 	case "migrate-source-all":
 		return migrateSourceAll(ctx, e)
 	case "capture":
